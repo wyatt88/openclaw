@@ -1,244 +1,475 @@
 /**
- * Federation Client — Phase 1: OpenAI API Bridge
+ * Federation Client — P2P bidirectional communication
  *
- * Communicates with peer OpenClaw instances via their standard
- * /v1/chat/completions HTTP endpoint.
- *
- * This is the lightest possible integration: no new protocol needed,
- * just standard HTTP + OpenAI-compatible JSON.
+ * Each OpenClaw instance is both client AND server:
+ * - Listens for incoming peer connections (via Gateway WS)
+ * - Initiates outgoing connections to known peers
+ * - All messages are signed with Ed25519
+ * - Challenge-Response mutual authentication
  */
 
+import {
+  createSignedMessage,
+  verifySignedMessage,
+  generateChallenge,
+  signPayload,
+  verifySignature,
+  createCapabilityGrant,
+  loadOrCreateFederationIdentity,
+  formatPeerId,
+} from "./crypto.js";
+import { TrustStore } from "./trust-store.js";
 import type {
-  FederationChatResult,
   FederationConfig,
-  FederationPeer,
-  FederationPeerHealth,
+  FederationLocalIdentity,
+  FederationMessagePayload,
+  FederationStatus,
+  HelloMessage,
+  HelloAckMessage,
+  HelloVerifiedMessage,
+  ChatMessage,
+  ChatResponseMessage,
+  SignedMessage,
+  TrustedPeer,
+  FEDERATION_PROTOCOL_VERSION,
+  FederationCapability,
+  FEDERATION_SYSTEM_PROMPT,
+  FEDERATION_TOOL_ALLOWLIST,
 } from "./types.js";
 
-const DEFAULT_TIMEOUT_MS = 120_000; // 2 minutes
-const HEALTH_CHECK_TIMEOUT_MS = 10_000;
+// ─── Federation Node ────────────────────────────────────────
+
+type PendingHandshake = {
+  challenge: string;
+  counterChallenge?: string;
+  startedAt: number;
+  peerId?: string;
+};
+
+type ChatHandler = (params: {
+  peerId: string;
+  peerName: string;
+  conversationId: string;
+  text: string;
+}) => Promise<string>;
+
+type EventHandler = (event: string, data: unknown) => void;
 
 /**
- * Send a chat message to a peer Gateway via /v1/chat/completions.
+ * FederationNode — manages all peer connections and communication.
+ *
+ * This is the main entry point for federation functionality.
+ * It handles identity, trust, handshakes, and message routing.
  */
-export async function sendChatToPeer(params: {
-  peer: FederationPeer;
-  message: string;
-  systemPrompt?: string;
-  model?: string;
-  stream?: boolean;
-}): Promise<FederationChatResult> {
-  const { peer, message, systemPrompt, model, stream } = params;
-  const url = `${peer.url.replace(/\/$/, "")}/v1/chat/completions`;
-  const timeoutMs = peer.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const startedAt = Date.now();
+export class FederationNode {
+  readonly identity: FederationLocalIdentity;
+  readonly trustStore: TrustStore;
+  private chatHandler: ChatHandler | null = null;
+  private eventHandler: EventHandler | null = null;
+  private readonly pendingHandshakes = new Map<string, PendingHandshake>();
+  private readonly conversations = new Map<string, { peerId: string; messages: Array<{ role: string; text: string }> }>();
+  private readonly config: FederationConfig;
 
-  const messages: Array<{ role: string; content: string }> = [];
-  if (systemPrompt) {
-    messages.push({ role: "system", content: systemPrompt });
-  }
-  messages.push({ role: "user", content: message });
+  constructor(config: FederationConfig) {
+    this.config = config;
+    this.identity = loadOrCreateFederationIdentity(config.instanceName);
+    this.trustStore = new TrustStore();
 
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-  };
-  if (peer.token) {
-    headers["Authorization"] = `Bearer ${peer.token}`;
-  }
+    // Import pre-configured trusted peers
+    if (config.trustedPeers) {
+      for (const peerConfig of config.trustedPeers) {
+        const peerId = peerConfig.publicKey.includes("BEGIN")
+          ? undefined // Will be derived
+          : peerConfig.publicKey;
 
-  const body = JSON.stringify({
-    model: model ?? "default",
-    messages,
-    stream: stream ?? false,
-  });
+        const grant = createCapabilityGrant(this.identity, {
+          grantee: peerId ?? "pending",
+          capabilities: peerConfig.capabilities ?? ["chat"],
+          rateLimit: peerConfig.rateLimit ?? config.defaultRateLimit,
+        });
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
+        // Only add if not already in trust store
+        const existingPeers = this.trustStore.listPeers();
+        const alreadyExists = existingPeers.some(
+          (p) => p.identity.publicKeyPem === peerConfig.publicKey ||
+                 p.identity.name === peerConfig.name
+        );
 
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers,
-      body,
-      signal: controller.signal,
-    });
-
-    if (!response.ok) {
-      const errorBody = await response.text().catch(() => "");
-      return {
-        ok: false,
-        peerId: peer.id,
-        error: `HTTP ${response.status}: ${errorBody.slice(0, 500)}`,
-        latencyMs: Date.now() - startedAt,
-      };
-    }
-
-    const result = (await response.json()) as {
-      choices?: Array<{ message?: { content?: string } }>;
-      model?: string;
-      usage?: {
-        prompt_tokens?: number;
-        completion_tokens?: number;
-        total_tokens?: number;
-      };
-    };
-
-    const text = result.choices?.[0]?.message?.content ?? undefined;
-
-    return {
-      ok: true,
-      peerId: peer.id,
-      text,
-      model: result.model ?? model,
-      usage: result.usage,
-      latencyMs: Date.now() - startedAt,
-    };
-  } catch (err) {
-    const isAbort = err instanceof DOMException && err.name === "AbortError";
-    return {
-      ok: false,
-      peerId: peer.id,
-      error: isAbort
-        ? `Timeout after ${timeoutMs}ms`
-        : err instanceof Error
-          ? err.message
-          : String(err),
-      latencyMs: Date.now() - startedAt,
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * Check health of a peer Gateway by hitting /health.
- */
-export async function checkPeerHealth(peer: FederationPeer): Promise<FederationPeerHealth> {
-  const url = `${peer.url.replace(/\/$/, "")}/health`;
-  const startedAt = Date.now();
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), HEALTH_CHECK_TIMEOUT_MS);
-
-  try {
-    const response = await fetch(url, {
-      method: "GET",
-      signal: controller.signal,
-    });
-
-    return {
-      peerId: peer.id,
-      peerName: peer.name,
-      reachable: response.ok,
-      latencyMs: Date.now() - startedAt,
-      error: response.ok ? undefined : `HTTP ${response.status}`,
-      checkedAt: Date.now(),
-    };
-  } catch (err) {
-    return {
-      peerId: peer.id,
-      peerName: peer.name,
-      reachable: false,
-      latencyMs: Date.now() - startedAt,
-      error: err instanceof Error ? err.message : String(err),
-      checkedAt: Date.now(),
-    };
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-/**
- * Federation Registry — manages known peers and their state.
- */
-export class FederationRegistry {
-  private readonly peers: Map<string, FederationPeer> = new Map();
-  private readonly healthCache: Map<string, FederationPeerHealth> = new Map();
-
-  constructor(config?: FederationConfig) {
-    if (config?.peers) {
-      for (const peer of config.peers) {
-        this.peers.set(peer.id, peer);
+        if (!alreadyExists) {
+          try {
+            this.trustStore.addDirectPeer({
+              identity: {
+                peerId: peerId ?? "",
+                publicKeyPem: peerConfig.publicKey,
+                name: peerConfig.name,
+              },
+              endpoint: peerConfig.endpoint,
+              grant,
+            });
+          } catch {
+            // Skip invalid peer configs
+          }
+        }
       }
     }
   }
 
-  getPeer(id: string): FederationPeer | undefined {
-    return this.peers.get(id);
-  }
-
-  listPeers(): FederationPeer[] {
-    return Array.from(this.peers.values());
-  }
-
-  addPeer(peer: FederationPeer): void {
-    this.peers.set(peer.id, peer);
-  }
-
-  removePeer(id: string): boolean {
-    this.healthCache.delete(id);
-    return this.peers.delete(id);
-  }
-
-  getHealth(peerId: string): FederationPeerHealth | undefined {
-    return this.healthCache.get(peerId);
+  /**
+   * Register a handler for incoming chat messages.
+   * The handler receives the message and returns a response.
+   */
+  onChat(handler: ChatHandler): void {
+    this.chatHandler = handler;
   }
 
   /**
-   * Check health of all registered peers.
+   * Register a handler for federation events.
    */
-  async checkAllHealth(): Promise<FederationPeerHealth[]> {
-    const results = await Promise.all(
-      this.listPeers().map((peer) => checkPeerHealth(peer)),
-    );
-    for (const result of results) {
-      this.healthCache.set(result.peerId, result);
-    }
-    return results;
+  onEvent(handler: EventHandler): void {
+    this.eventHandler = handler;
   }
 
+  private emit(event: string, data: unknown): void {
+    this.eventHandler?.(event, data);
+  }
+
+  // ─── Handshake (Challenge-Response) ─────────────────────
+
   /**
-   * Send a chat message to a specific peer.
+   * Step 1: Initiate handshake with a peer.
+   * Returns a signed Hello message.
    */
-  async chat(params: {
-    peerId: string;
-    message: string;
-    systemPrompt?: string;
-    model?: string;
-  }): Promise<FederationChatResult> {
-    const peer = this.peers.get(params.peerId);
-    if (!peer) {
-      return {
-        ok: false,
-        peerId: params.peerId,
-        error: `Unknown peer: ${params.peerId}`,
-        latencyMs: 0,
-      };
-    }
-    return sendChatToPeer({
-      peer,
-      message: params.message,
-      systemPrompt: params.systemPrompt,
-      model: params.model,
+  createHello(): SignedMessage {
+    const challenge = generateChallenge();
+    const hello: HelloMessage = {
+      type: "hello",
+      data: {
+        identity: {
+          peerId: this.identity.peerId,
+          publicKeyPem: this.identity.publicKeyPem,
+          name: this.identity.name,
+        },
+        challenge,
+        protocolVersion: 1,
+        timestamp: Date.now(),
+      },
+    };
+
+    this.pendingHandshakes.set("outgoing", {
+      challenge,
+      startedAt: Date.now(),
     });
+
+    return createSignedMessage(this.identity, hello);
   }
 
   /**
-   * Broadcast a message to all peers and collect responses.
+   * Step 2: Handle incoming Hello, create HelloAck.
+   * Verifies the sender and responds with counter-challenge.
    */
-  async broadcast(params: {
-    message: string;
-    systemPrompt?: string;
-    model?: string;
-  }): Promise<FederationChatResult[]> {
-    return Promise.all(
-      this.listPeers().map((peer) =>
-        sendChatToPeer({
-          peer,
-          message: params.message,
-          systemPrompt: params.systemPrompt,
-          model: params.model,
-        }),
-      ),
+  handleHello(
+    message: SignedMessage,
+  ): { ok: true; response: SignedMessage } | { ok: false; error: string } {
+    // Look up sender in trust store
+    const peer = this.trustStore.getPeer(message.senderId);
+    if (!peer) {
+      return { ok: false, error: `Unknown peer: ${formatPeerId(message.senderId)}` };
+    }
+
+    // Verify message signature
+    const verified = verifySignedMessage(peer.identity.publicKeyPem, message);
+    if (!verified.valid) {
+      return { ok: false, error: `Invalid signature: ${verified.error}` };
+    }
+
+    const hello = verified.payload as HelloMessage;
+    if (hello.type !== "hello") {
+      return { ok: false, error: `Expected hello, got ${hello.type}` };
+    }
+
+    // Sign their challenge (proves we have our private key)
+    const challengeResponse = signPayload(
+      this.identity.privateKeyPem,
+      hello.data.challenge,
     );
+
+    // Create our counter-challenge
+    const counterChallenge = generateChallenge();
+
+    this.pendingHandshakes.set(message.senderId, {
+      challenge: hello.data.challenge,
+      counterChallenge,
+      startedAt: Date.now(),
+      peerId: message.senderId,
+    });
+
+    const ack: HelloAckMessage = {
+      type: "hello.ack",
+      data: {
+        identity: {
+          peerId: this.identity.peerId,
+          publicKeyPem: this.identity.publicKeyPem,
+          name: this.identity.name,
+        },
+        challengeResponse,
+        counterChallenge,
+        protocolVersion: 1,
+        timestamp: Date.now(),
+      },
+    };
+
+    return { ok: true, response: createSignedMessage(this.identity, ack) };
+  }
+
+  /**
+   * Step 3: Handle HelloAck, create HelloVerified.
+   * Verifies the peer's challenge response and sends final verification.
+   */
+  handleHelloAck(
+    message: SignedMessage,
+  ): { ok: true; response: SignedMessage; peerId: string } | { ok: false; error: string } {
+    const pending = this.pendingHandshakes.get("outgoing");
+    if (!pending) {
+      return { ok: false, error: "No pending outgoing handshake" };
+    }
+
+    // Look up sender
+    const peer = this.trustStore.getPeer(message.senderId);
+    if (!peer) {
+      return { ok: false, error: `Unknown peer: ${formatPeerId(message.senderId)}` };
+    }
+
+    // Verify message
+    const verified = verifySignedMessage(peer.identity.publicKeyPem, message);
+    if (!verified.valid) {
+      return { ok: false, error: `Invalid signature: ${verified.error}` };
+    }
+
+    const ack = verified.payload as HelloAckMessage;
+    if (ack.type !== "hello.ack") {
+      return { ok: false, error: `Expected hello.ack, got ${ack.type}` };
+    }
+
+    // Verify their challenge response (proves they have their private key)
+    const challengeValid = verifySignature(
+      peer.identity.publicKeyPem,
+      pending.challenge,
+      ack.data.challengeResponse,
+    );
+    if (!challengeValid) {
+      return { ok: false, error: "Challenge response verification failed" };
+    }
+
+    // Sign their counter-challenge
+    const counterChallengeResponse = signPayload(
+      this.identity.privateKeyPem,
+      ack.data.counterChallenge,
+    );
+
+    // Create capability grant for this peer
+    const grant = createCapabilityGrant(this.identity, {
+      grantee: message.senderId,
+      capabilities: peer.grantedCapabilities.capabilities,
+      rateLimit: peer.grantedCapabilities.rateLimit,
+    });
+
+    const verifiedMsg: HelloVerifiedMessage = {
+      type: "hello.verified",
+      data: {
+        counterChallengeResponse,
+        capabilityGrant: grant,
+        timestamp: Date.now(),
+      },
+    };
+
+    this.pendingHandshakes.delete("outgoing");
+    this.trustStore.setConnected(message.senderId, true);
+    this.emit("peer.connected", { peerId: message.senderId, peerName: peer.identity.name });
+
+    return {
+      ok: true,
+      response: createSignedMessage(this.identity, verifiedMsg),
+      peerId: message.senderId,
+    };
+  }
+
+  /**
+   * Step 4: Handle HelloVerified (completes handshake on responder side).
+   */
+  handleHelloVerified(
+    message: SignedMessage,
+  ): { ok: true } | { ok: false; error: string } {
+    const pending = this.pendingHandshakes.get(message.senderId);
+    if (!pending?.counterChallenge) {
+      return { ok: false, error: "No pending handshake for this peer" };
+    }
+
+    const peer = this.trustStore.getPeer(message.senderId);
+    if (!peer) {
+      return { ok: false, error: `Unknown peer: ${formatPeerId(message.senderId)}` };
+    }
+
+    const verified = verifySignedMessage(peer.identity.publicKeyPem, message);
+    if (!verified.valid) {
+      return { ok: false, error: `Invalid signature: ${verified.error}` };
+    }
+
+    const verifiedMsg = verified.payload as HelloVerifiedMessage;
+
+    // Verify counter-challenge response
+    const valid = verifySignature(
+      peer.identity.publicKeyPem,
+      pending.counterChallenge,
+      verifiedMsg.data.counterChallengeResponse,
+    );
+    if (!valid) {
+      return { ok: false, error: "Counter-challenge verification failed" };
+    }
+
+    // Store received capability grant
+    if (verifiedMsg.data.capabilityGrant) {
+      this.trustStore.setReceivedCapabilities(message.senderId, verifiedMsg.data.capabilityGrant);
+    }
+
+    this.pendingHandshakes.delete(message.senderId);
+    this.trustStore.setConnected(message.senderId, true);
+    this.emit("peer.connected", { peerId: message.senderId, peerName: peer.identity.name });
+
+    return { ok: true };
+  }
+
+  // ─── Chat ───────────────────────────────────────────────
+
+  /**
+   * Send a chat message to a connected peer.
+   */
+  createChatMessage(params: {
+    peerId: string;
+    text: string;
+    conversationId?: string;
+  }): { ok: true; message: SignedMessage; conversationId: string } | { ok: false; error: string } {
+    const peer = this.trustStore.getPeer(params.peerId);
+    if (!peer) {
+      return { ok: false, error: `Unknown peer: ${params.peerId}` };
+    }
+    if (!peer.connected) {
+      return { ok: false, error: `Peer not connected: ${peer.identity.name}` };
+    }
+
+    // Check capability
+    if (!this.trustStore.weHaveCapabilityOn(params.peerId, "chat")) {
+      return { ok: false, error: `No chat capability granted by peer ${peer.identity.name}` };
+    }
+
+    // Check rate limit (on our side)
+    if (!this.trustStore.checkRateLimit(params.peerId)) {
+      return { ok: false, error: "Rate limit exceeded" };
+    }
+
+    const conversationId = params.conversationId ?? `conv-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    const chat: ChatMessage = {
+      type: "chat",
+      data: {
+        conversationId,
+        text: params.text,
+      },
+    };
+
+    return {
+      ok: true,
+      message: createSignedMessage(this.identity, chat),
+      conversationId,
+    };
+  }
+
+  /**
+   * Handle an incoming chat message from a peer.
+   */
+  async handleChatMessage(
+    message: SignedMessage,
+  ): Promise<{ ok: true; response: SignedMessage } | { ok: false; error: string }> {
+    const peer = this.trustStore.getPeer(message.senderId);
+    if (!peer) {
+      return { ok: false, error: `Unknown peer: ${message.senderId}` };
+    }
+
+    // Verify
+    const verified = verifySignedMessage(peer.identity.publicKeyPem, message);
+    if (!verified.valid) {
+      return { ok: false, error: `Invalid signature: ${verified.error}` };
+    }
+
+    // Check capability
+    if (!this.trustStore.peerHasCapability(message.senderId, "chat")) {
+      return { ok: false, error: "Peer does not have chat capability" };
+    }
+
+    // Check rate limit
+    if (!this.trustStore.checkRateLimit(message.senderId)) {
+      return { ok: false, error: "Rate limit exceeded" };
+    }
+
+    const chat = verified.payload as ChatMessage;
+    if (chat.type !== "chat") {
+      return { ok: false, error: `Expected chat, got ${chat.type}` };
+    }
+
+    // Delegate to chat handler (runs the Agent in a federation session)
+    if (!this.chatHandler) {
+      return { ok: false, error: "No chat handler registered" };
+    }
+
+    const responseText = await this.chatHandler({
+      peerId: message.senderId,
+      peerName: peer.identity.name,
+      conversationId: chat.data.conversationId,
+      text: chat.data.text,
+    });
+
+    const response: ChatResponseMessage = {
+      type: "chat.response",
+      data: {
+        conversationId: chat.data.conversationId,
+        text: responseText,
+        deferredToOwner: false,
+      },
+    };
+
+    return { ok: true, response: createSignedMessage(this.identity, response) };
+  }
+
+  // ─── Status ─────────────────────────────────────────────
+
+  getStatus(): FederationStatus {
+    const peers = this.trustStore.listPeers().map((peer) => ({
+      peerId: peer.identity.peerId,
+      peerName: peer.identity.name,
+      connected: peer.connected,
+      trust: peer.trust,
+      lastSeenAt: peer.lastSeenAt,
+      capabilities: peer.grantedCapabilities.capabilities,
+    }));
+
+    return {
+      enabled: this.config.enabled,
+      identity: {
+        peerId: this.identity.peerId,
+        publicKeyPem: this.identity.publicKeyPem,
+        name: this.identity.name,
+      },
+      peers,
+      totalConnected: peers.filter((p) => p.connected).length,
+      totalTrusted: peers.filter((p) => p.trust === "direct" || p.trust === "vouched").length,
+    };
+  }
+
+  /**
+   * Disconnect a peer.
+   */
+  disconnectPeer(peerId: string): void {
+    this.trustStore.setConnected(peerId, false);
+    this.pendingHandshakes.delete(peerId);
+    this.emit("peer.disconnected", { peerId });
   }
 }
