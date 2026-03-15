@@ -299,6 +299,15 @@ const entries: SubCliEntry[] = [
     },
   },
   {
+    name: "federation",
+    description: "Multi-instance federation: pairing, peers, and cross-agent chat",
+    hasSubcommands: true,
+    register: async (program) => {
+      const mod = await import("../../federation/cli.js");
+      mod.registerFederationCli(program);
+    },
+  },
+  {
     name: "completion",
     description: "Generate shell completion script",
     hasSubcommands: false,
