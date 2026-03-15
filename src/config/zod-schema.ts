@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { parseByteSize } from "../cli/parse-bytes.js";
 import { parseDurationMs } from "../cli/parse-duration.js";
+import { FederationConfigZod } from "../federation/config.js";
 import { ToolsSchema } from "./zod-schema.agent-runtime.js";
 import { AgentsSchema, AudioSchema, BindingsSchema, BroadcastSchema } from "./zod-schema.agents.js";
 import { ApprovalsSchema } from "./zod-schema.approvals.js";
@@ -901,6 +902,7 @@ export const OpenClawSchema = z
       })
       .strict()
       .optional(),
+    federation: FederationConfigZod.optional(),
   })
   .strict()
   .superRefine((cfg, ctx) => {
