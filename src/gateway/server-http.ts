@@ -759,6 +759,10 @@ export function createGatewayHttpServer(opts: {
       });
 
   async function handleRequest(req: IncomingMessage, res: ServerResponse) {
+    // Skip if already handled by a prepended listener (e.g. federation)
+    if (res.headersSent || res.writableEnded) {
+      return;
+    }
     setDefaultSecurityHeaders(res, {
       strictTransportSecurity: strictTransportSecurityHeader,
     });
