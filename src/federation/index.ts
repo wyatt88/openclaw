@@ -20,7 +20,12 @@
 
 // Core
 export { FederationNode } from "./client.js";
+export { FederationTransport } from "./transport.js";
 export { TrustStore } from "./trust-store.js";
+
+// Gateway Integration
+export { initFederation, getDefaultFederationConfig } from "./gateway-integration.js";
+export type { FederationHandle, FederationInitOptions } from "./gateway-integration.js";
 
 // Crypto
 export {
