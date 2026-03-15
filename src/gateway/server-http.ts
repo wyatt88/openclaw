@@ -712,6 +712,18 @@ export function createHooksRequestHandler(
   };
 }
 
+// Federation / extension request handlers (registered at runtime via prependHttpHandler)
+type ExtraHttpHandler = (
+  req: import("node:http").IncomingMessage,
+  res: import("node:http").ServerResponse,
+) => Promise<boolean>;
+const _extraHttpHandlers: ExtraHttpHandler[] = [];
+
+/** Register a handler that runs before the main Gateway request handler. Return true if handled. */
+export function prependHttpHandler(handler: ExtraHttpHandler): void {
+  _extraHttpHandlers.unshift(handler);
+}
+
 export function createGatewayHttpServer(opts: {
   canvasHost: CanvasHostHandler | null;
   clients: Set<GatewayWsClient>;
@@ -759,9 +771,16 @@ export function createGatewayHttpServer(opts: {
       });
 
   async function handleRequest(req: IncomingMessage, res: ServerResponse) {
-    // Skip if already handled by a prepended listener (e.g. federation)
-    if (res.headersSent || res.writableEnded) {
-      return;
+    // Run extra handlers first (federation, etc.)
+    for (const handler of _extraHttpHandlers) {
+      try {
+        const handled = await handler(req, res);
+        if (handled) {
+          return;
+        }
+      } catch {
+        /* ignore */
+      }
     }
     setDefaultSecurityHeaders(res, {
       strictTransportSecurity: strictTransportSecurityHeader,
