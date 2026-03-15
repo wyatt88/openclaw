@@ -41,8 +41,16 @@ export {
   derivePeerIdFromPublicKey,
 } from "./crypto.js";
 
+// Pairing
+export { PairingManager, encodePairingCode, decodePairingCode } from "./pairing.js";
+export type { PairingCodeData, PairingResult } from "./pairing.js";
+
 // Tools
 export { createFederationTools } from "./tools.js";
+
+// Web UI HTTP API
+export { registerFederationWebRoutes } from "./web-ui.js";
+export type { FederationWebRouteOptions } from "./web-ui.js";
 
 // Types
 export type {
@@ -59,6 +67,10 @@ export type {
   SignedMessage,
   FederationMessagePayload,
   FederationMessageType,
+  SimplePeerConfig,
+  DelegateMessage,
+  DelegateResponseMessage,
+  BroadcastMessage,
 } from "./types.js";
 
 export {

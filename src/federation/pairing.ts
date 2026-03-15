@@ -46,6 +46,90 @@ import type {
   FederationCapability,
 } from "./types.js";
 
+// ─── Pairing Code (OC- format) ─────────────────────────────
+
+/**
+ * Data embedded in an OC- pairing code.
+ * Contains everything the acceptor needs to initiate a connection.
+ */
+export type PairingCodeData = {
+  /** Ed25519 public key (base64). */
+  publicKey: string;
+  /** Initiator's federation endpoint (wss:// URL). */
+  endpoint: string;
+  /** One-time challenge for anti-replay. */
+  challenge: string;
+  /** Expiration timestamp (ms since epoch). */
+  expiresAt: number;
+  /** Instance name. */
+  instanceName?: string;
+};
+
+/**
+ * Encode pairing data into an OC- prefixed, dash-segmented code.
+ *
+ * Format: `OC-xxxx-xxxx-...-xxxx`
+ *   1. JSON.stringify(PairingCodeData)
+ *   2. base64url encode (using only [A-Za-z0-9_] — no `-` to avoid delimiter collision)
+ *   3. Split every 4 chars, join with `-`
+ *   4. Prefix `OC-`
+ */
+export function encodePairingCode(data: PairingCodeData): string {
+  const json = JSON.stringify(data);
+  // base64url with `-` replaced by `.` to avoid collision with segment delimiter
+  const b64 = Buffer.from(json, "utf8")
+    .toString("base64")
+    .replaceAll("+", ".")
+    .replaceAll("/", "_")
+    .replace(/=+$/g, "");
+  // Segment every 4 characters
+  const segments: string[] = [];
+  for (let i = 0; i < b64.length; i += 4) {
+    segments.push(b64.slice(i, i + 4));
+  }
+  return `OC-${segments.join("-")}`;
+}
+
+/**
+ * Decode an OC- pairing code back into {@link PairingCodeData}.
+ *
+ * Returns `null` if the code is malformed or unparseable.
+ */
+export function decodePairingCode(code: string): PairingCodeData | null {
+  try {
+    // Strip OC- prefix
+    let raw = code.trim();
+    if (!raw.startsWith("OC-")) {
+      return null;
+    }
+    raw = raw.slice(3);
+
+    // Remove segment dashes to reconstruct the encoded string
+    const encoded = raw.replaceAll("-", "");
+
+    // Reverse our custom encoding: `.` → `+`, `_` → `/`
+    const b64 = encoded.replace(/\./g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - (b64.length % 4)) % 4);
+    const json = Buffer.from(padded, "base64").toString("utf8");
+
+    const data = JSON.parse(json) as PairingCodeData;
+
+    // Minimal validation
+    if (
+      typeof data.publicKey !== "string" ||
+      typeof data.endpoint !== "string" ||
+      typeof data.challenge !== "string" ||
+      typeof data.expiresAt !== "number"
+    ) {
+      return null;
+    }
+
+    return data;
+  } catch {
+    return null;
+  }
+}
+
 // ─── Types ──────────────────────────────────────────────────
 
 export type PairingSessionState =
@@ -590,6 +674,163 @@ export class PairingManager extends EventEmitter {
       grant,
       timestamp: Date.now(),
     };
+  }
+
+  // ─── Method C: OC- Code Pairing (Endpoint-based) ──────
+
+  /**
+   * Generate a pairing code that embeds our endpoint + public key.
+   * The recipient can pair by just entering this code + their own endpoint.
+   */
+  generatePairingCode(params: { endpoint: string; expiresInMs?: number }): {
+    code: string;
+    data: PairingCodeData;
+  } {
+    const challenge = generateChallenge();
+    const expiresAt = Date.now() + (params.expiresInMs ?? 5 * 60 * 1000);
+
+    const data: PairingCodeData = {
+      publicKey: extractBase64PublicKey(this.identity.publicKeyPem),
+      endpoint: params.endpoint,
+      challenge,
+      expiresAt,
+      instanceName: this.identity.name,
+    };
+
+    return { code: encodePairingCode(data), data };
+  }
+
+  /**
+   * Accept a pairing code and initiate connection to the remote peer.
+   *
+   * Flow:
+   *   1. Decode pairing code → remote publicKey + endpoint
+   *   2. Verify not expired
+   *   3. Connect to remote endpoint, send our publicKey + endpoint + challenge response
+   *   4. Both sides verify → mutual trust established
+   *   5. Return PairingResult
+   *
+   * @param code - The OC-xxxx-xxxx pairing code
+   * @param ourEndpoint - Our federation endpoint (wss:// URL)
+   * @returns PairingResult on success
+   */
+  async acceptPairingCode(
+    code: string,
+    ourEndpoint: string,
+  ): Promise<{ ok: true; result: PairingResult } | { ok: false; error: string }> {
+    // 1. Decode the pairing code
+    const data = decodePairingCode(code);
+    if (!data) {
+      return { ok: false, error: "Invalid pairing code format" };
+    }
+
+    // 2. Check expiration
+    if (Date.now() > data.expiresAt) {
+      return { ok: false, error: "Pairing code has expired" };
+    }
+
+    // 3. Build our challenge response (sign the remote challenge)
+    const challengeResponse = signPayload(this.identity.privateKeyPem, data.challenge);
+    const ourChallenge = generateChallenge();
+
+    // 4. Send pairing request to the initiator's endpoint
+    const pairingPayload = {
+      identity: {
+        peerId: this.identity.peerId,
+        publicKeyPem: this.identity.publicKeyPem,
+        name: this.identity.name,
+      },
+      endpoint: { wsUrl: ourEndpoint } as PeerEndpoint,
+      challengeResponse,
+      challenge: ourChallenge,
+      timestamp: Date.now(),
+    };
+
+    let response: Response;
+    try {
+      // Derive HTTP URL from wss:// endpoint for pairing handshake
+      const httpBase = data.endpoint
+        .replace(/^wss:\/\//, "https://")
+        .replace(/^ws:\/\//, "http://");
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15_000);
+      response = await fetch(`${httpBase}/federation/pair/code-accept`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(pairingPayload),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+    } catch (err) {
+      return {
+        ok: false,
+        error: `Cannot reach peer at ${data.endpoint}: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+
+    if (!response.ok) {
+      const body = (await response.json().catch(() => ({ error: "Unknown error" }))) as {
+        error?: string;
+      };
+      return { ok: false, error: body.error ?? `HTTP ${response.status}` };
+    }
+
+    const body = (await response.json()) as {
+      ok: boolean;
+      identity?: FederationIdentity;
+      endpoint?: PeerEndpoint;
+      challengeResponse?: string;
+      grant?: CapabilityGrant;
+      error?: string;
+    };
+
+    if (!body.ok || !body.identity || !body.challengeResponse) {
+      return { ok: false, error: body.error ?? "Invalid response from peer" };
+    }
+
+    // 5. Verify the peer's challenge response (they signed OUR challenge)
+    if (!verifySignature(body.identity.publicKeyPem, ourChallenge, body.challengeResponse)) {
+      return { ok: false, error: "Challenge verification failed — peer identity not verified" };
+    }
+
+    // Verify peer ID matches public key
+    const derivedPeerId = derivePeerIdFromPublicKey(body.identity.publicKeyPem);
+    if (derivedPeerId !== body.identity.peerId) {
+      return { ok: false, error: "Peer ID does not match public key" };
+    }
+
+    // 6. Store the peer in trust store
+    const peerEndpoint: PeerEndpoint = body.endpoint ?? { wsUrl: data.endpoint };
+    const grant =
+      body.grant ??
+      createCapabilityGrant(this.identity, {
+        grantee: body.identity.peerId,
+        capabilities: [...DEFAULT_CAPABILITIES],
+      });
+
+    try {
+      this.trustStore.addDirectPeer({
+        identity: body.identity,
+        endpoint: peerEndpoint,
+        grant,
+      });
+    } catch (err) {
+      return {
+        ok: false,
+        error: `Failed to store peer: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+
+    const result: PairingResult = {
+      peerId: body.identity.peerId,
+      peerName: body.identity.name,
+      peerIdentity: body.identity,
+      peerEndpoint: peerEndpoint,
+      grantedCapabilities: grant.capabilities,
+    };
+
+    this.emit("session:completed", result);
+    return { ok: true, result };
   }
 
   // ─── Method B: Tailscale Auto-Discovery ───────────────

@@ -103,6 +103,35 @@ const TrustedPeerConfigSchema = z
 
 export type TrustedPeerConfig = z.infer<typeof TrustedPeerConfigSchema>;
 
+// ─── Simple Peer (token-auth, simplified config) ────────────
+
+/**
+ * Simplified peer configuration using token-based auth.
+ * No Ed25519 key exchange needed.
+ *
+ * ```yaml
+ * federation:
+ *   peers:
+ *     - name: Luna
+ *       endpoint: wss://luna.doublewen.cloud
+ *       token: luna-federation-token-2026-secure
+ * ```
+ */
+const SimplePeerConfigSchema = z
+  .object({
+    /** Human-readable display name. */
+    name: z.string().min(1).max(128),
+    /** Peer's public endpoint URL (wss:// or https://). */
+    endpoint: z.string().url(),
+    /** Peer's gateway auth token for API access. */
+    token: z.string().min(1),
+    /** Capabilities to grant this peer. Defaults to ["chat"]. */
+    capabilities: z.array(FederationCapabilitySchema).optional(),
+  })
+  .strict();
+
+export type SimplePeerConfigZod = z.infer<typeof SimplePeerConfigSchema>;
+
 // ─── Top-level Federation Config ────────────────────────────
 
 /**
@@ -116,6 +145,11 @@ export type TrustedPeerConfig = z.infer<typeof TrustedPeerConfigSchema>;
  *   enabled: true
  *   instanceName: "Ark"
  *   trustedPeers: [...]
+ *   endpoint: "wss://my-instance.example.com/federation"
+ *   peers:
+ *     - name: "Nova"
+ *       endpoint: "wss://nova.example.com/federation"
+ *       token: "gw-token-xxx"
  * ```
  */
 export const FederationConfigZod = z
@@ -130,10 +164,23 @@ export const FederationConfigZod = z
     instanceName: z.string().min(1).max(128).optional(),
 
     /**
-     * Pre-approved peers loaded from config.
+     * This instance's public endpoint URL for federation.
+     * Used by peers to connect back to this instance.
+     */
+    endpoint: z.string().url().optional(),
+
+    /**
+     * Pre-approved peers loaded from config (Ed25519 key exchange).
      * At runtime, additional peers may be added via the trust store.
      */
     trustedPeers: z.array(TrustedPeerConfigSchema).optional(),
+
+    /**
+     * Simplified peer list using token auth (alternative to trustedPeers).
+     * No Ed25519 key exchange needed — uses gateway token for auth.
+     * Can coexist with trustedPeers.
+     */
+    peers: z.array(SimplePeerConfigSchema).optional(),
 
     /**
      * Default rate limits applied to peers that do not specify their own.
@@ -223,6 +270,32 @@ export const FederationConfigZod = z
       }
       keys.add(key);
     }
+
+    // Validate simplified peers have unique names
+    const simplePeers = val.peers ?? [];
+    const simplePeerNames = new Set<string>();
+    for (let i = 0; i < simplePeers.length; i++) {
+      const name = simplePeers[i].name;
+      if (simplePeerNames.has(name)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["peers", i, "name"],
+          message: `Duplicate simple peer name "${name}" — each peer must have a unique name`,
+        });
+      }
+      simplePeerNames.add(name);
+    }
+
+    // Ensure no name collision between trustedPeers and simplified peers
+    for (let i = 0; i < simplePeers.length; i++) {
+      if (names.has(simplePeers[i].name)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["peers", i, "name"],
+          message: `Peer name "${simplePeers[i].name}" conflicts with a trustedPeer — names must be unique across both lists`,
+        });
+      }
+    }
   });
 
 // Re-export the inferred Zod type (useful for tests / type guards)
@@ -287,12 +360,19 @@ export function parseFederationConfig(raw: unknown): FederationConfig {
   return {
     enabled: parsed.enabled ?? defaults.enabled,
     instanceName: parsed.instanceName ?? defaults.instanceName,
+    endpoint: parsed.endpoint,
     trustedPeers: parsed.trustedPeers?.map((peer) => ({
       publicKey: peer.publicKey,
       name: peer.name,
       endpoint: peer.endpoint as PeerEndpoint,
       capabilities: peer.capabilities as FederationCapability[] | undefined,
       rateLimit: peer.rateLimit as CapabilityGrant["rateLimit"],
+    })),
+    peers: parsed.peers?.map((peer) => ({
+      name: peer.name,
+      endpoint: peer.endpoint,
+      token: peer.token,
+      capabilities: peer.capabilities as FederationCapability[] | undefined,
     })),
     defaultRateLimit: parsed.defaultRateLimit ?? defaults.defaultRateLimit,
     allowIntroductions: parsed.allowIntroductions ?? defaults.allowIntroductions,

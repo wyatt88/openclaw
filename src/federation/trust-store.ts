@@ -49,8 +49,16 @@ export class TrustStore {
   private peers: Map<string, TrustedPeer> = new Map();
   private readonly storePath: string;
 
-  constructor(storePath?: string) {
-    this.storePath = storePath ?? resolveTrustStorePath();
+  constructor(storePathOrOpts?: string | { stateDir?: string; storePath?: string }) {
+    if (typeof storePathOrOpts === "object" && storePathOrOpts !== null) {
+      this.storePath =
+        storePathOrOpts.storePath ??
+        (storePathOrOpts.stateDir
+          ? path.join(storePathOrOpts.stateDir, "federation", "trust-store.json")
+          : resolveTrustStorePath());
+    } else {
+      this.storePath = storePathOrOpts ?? resolveTrustStorePath();
+    }
     this.load();
   }
 
@@ -58,10 +66,14 @@ export class TrustStore {
 
   private load(): void {
     try {
-      if (!fs.existsSync(this.storePath)) return;
+      if (!fs.existsSync(this.storePath)) {
+        return;
+      }
       const raw = fs.readFileSync(this.storePath, "utf8");
       const stored = JSON.parse(raw) as StoredTrustStore;
-      if (stored?.version !== 1) return;
+      if (stored?.version !== 1) {
+        return;
+      }
 
       for (const [peerId, peer] of Object.entries(stored.peers)) {
         this.peers.set(peerId, { ...peer, connected: false });
@@ -76,7 +88,7 @@ export class TrustStore {
       version: 1,
       peers: Object.fromEntries(
         Array.from(this.peers.entries()).map(([id, peer]) => {
-          const { connected, ...rest } = peer;
+          const { connected: _connected, ...rest } = peer;
           return [id, rest];
         }),
       ),
@@ -121,9 +133,7 @@ export class TrustStore {
     // Verify peerId matches public key
     const derivedId = derivePeerIdFromPublicKey(params.identity.publicKeyPem);
     if (derivedId !== params.identity.peerId) {
-      throw new Error(
-        `Peer ID mismatch: expected ${derivedId}, got ${params.identity.peerId}`,
-      );
+      throw new Error(`Peer ID mismatch: expected ${derivedId}, got ${params.identity.peerId}`);
     }
 
     this.peers.set(params.identity.peerId, {
@@ -176,7 +186,9 @@ export class TrustStore {
    */
   removePeer(peerId: string): boolean {
     const deleted = this.peers.delete(peerId);
-    if (deleted) this.save();
+    if (deleted) {
+      this.save();
+    }
     return deleted;
   }
 
@@ -187,7 +199,9 @@ export class TrustStore {
     const peer = this.peers.get(peerId);
     if (peer) {
       peer.connected = connected;
-      if (connected) peer.lastSeenAt = Date.now();
+      if (connected) {
+        peer.lastSeenAt = Date.now();
+      }
     }
   }
 
@@ -196,7 +210,9 @@ export class TrustStore {
    */
   setReceivedCapabilities(peerId: string, grant: CapabilityGrant): void {
     const peer = this.peers.get(peerId);
-    if (!peer) return;
+    if (!peer) {
+      return;
+    }
 
     // Verify the grant is signed by the peer
     if (!verifyCapabilityGrant(peer.identity.publicKeyPem, grant)) {
@@ -214,11 +230,17 @@ export class TrustStore {
    */
   peerHasCapability(peerId: string, capability: FederationCapability): boolean {
     const peer = this.peers.get(peerId);
-    if (!peer) return false;
-    if (peer.trust === "unknown") return false;
+    if (!peer) {
+      return false;
+    }
+    if (peer.trust === "unknown") {
+      return false;
+    }
 
     const grant = peer.grantedCapabilities;
-    if (isCapabilityGrantExpired(grant)) return false;
+    if (isCapabilityGrantExpired(grant)) {
+      return false;
+    }
     return grant.capabilities.includes(capability);
   }
 
@@ -227,8 +249,12 @@ export class TrustStore {
    */
   weHaveCapabilityOn(peerId: string, capability: FederationCapability): boolean {
     const peer = this.peers.get(peerId);
-    if (!peer?.receivedCapabilities) return false;
-    if (isCapabilityGrantExpired(peer.receivedCapabilities)) return false;
+    if (!peer?.receivedCapabilities) {
+      return false;
+    }
+    if (isCapabilityGrantExpired(peer.receivedCapabilities)) {
+      return false;
+    }
     return peer.receivedCapabilities.capabilities.includes(capability);
   }
 
@@ -236,14 +262,21 @@ export class TrustStore {
    * Check rate limit for a peer.
    * Returns true if the request should be allowed.
    */
-  private readonly rateCounts = new Map<string, { minute: number; hour: number; day: number; lastReset: number }>();
+  private readonly rateCounts = new Map<
+    string,
+    { minute: number; hour: number; day: number; lastReset: number }
+  >();
 
   checkRateLimit(peerId: string): boolean {
     const peer = this.peers.get(peerId);
-    if (!peer) return false;
+    if (!peer) {
+      return false;
+    }
 
     const limit = peer.grantedCapabilities.rateLimit;
-    if (!limit) return true; // No limit configured
+    if (!limit) {
+      return true;
+    } // No limit configured
 
     const now = Date.now();
     let counts = this.rateCounts.get(peerId);
@@ -257,9 +290,15 @@ export class TrustStore {
     counts.hour++;
     counts.day++;
 
-    if (limit.maxMessagesPerMinute && counts.minute > limit.maxMessagesPerMinute) return false;
-    if (limit.maxMessagesPerHour && counts.hour > limit.maxMessagesPerHour) return false;
-    if (limit.maxMessagesPerDay && counts.day > limit.maxMessagesPerDay) return false;
+    if (limit.maxMessagesPerMinute && counts.minute > limit.maxMessagesPerMinute) {
+      return false;
+    }
+    if (limit.maxMessagesPerHour && counts.hour > limit.maxMessagesPerHour) {
+      return false;
+    }
+    if (limit.maxMessagesPerDay && counts.day > limit.maxMessagesPerDay) {
+      return false;
+    }
 
     return true;
   }

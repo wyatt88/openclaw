@@ -63,6 +63,24 @@ export type FederationTrustedPeerConfig = {
   rateLimit?: FederationRateLimitConfig;
 };
 
+// ─── Simplified Peer (token auth) ───────────────────────────
+
+/**
+ * Simplified peer configuration using token auth.
+ * No Ed25519 key exchange needed — uses gateway token for auth.
+ * Suitable for trusted internal networks or quick setup.
+ */
+export type FederationSimplePeerConfig = {
+  /** Human-readable display name for the peer. */
+  name: string;
+  /** Peer's public endpoint URL (wss:// or https://). */
+  endpoint: string;
+  /** Peer's gateway auth token for API access. */
+  token: string;
+  /** Capabilities to grant this peer. Defaults to ["chat"]. */
+  capabilities?: FederationCapability[];
+};
+
 // ─── Top-level Federation Config ────────────────────────────
 
 /**
@@ -88,6 +106,10 @@ export type FederationConfigSection = {
   trustStorePath?: string;
   /** Path to the Ed25519 identity keypair file. */
   identityKeyPath?: string;
+  /** This instance's public endpoint URL for federation. */
+  endpoint?: string;
+  /** Simplified peer list using token auth (alternative to trustedPeers). */
+  peers?: FederationSimplePeerConfig[];
   /** Dedicated federation WebSocket listener port. */
   port?: number;
   /** Bind address for the federation listener. */

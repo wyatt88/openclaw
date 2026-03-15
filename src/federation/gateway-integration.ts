@@ -26,6 +26,7 @@ import {
   FEDERATION_SYSTEM_PROMPT,
   FEDERATION_TOOL_ALLOWLIST,
 } from "./types.js";
+import { registerFederationWebRoutes } from "./web-ui.js";
 
 const log = createSubsystemLogger("federation");
 
@@ -55,6 +56,12 @@ export type FederationInitOptions = {
    * Typically the same server(s) the main Gateway uses.
    */
   httpServers: http.Server[];
+  /**
+   * Gateway auth token for the Web UI HTTP API.
+   * When provided, federation REST endpoints are registered on the
+   * first HTTP server and require this token for authorization.
+   */
+  gatewayToken?: string;
   /**
    * Callback to register tools into the Agent tool chain.
    * The Gateway provides this to inject federation tools alongside
@@ -585,6 +592,19 @@ export async function initFederation(
   setTimeout(() => {
     transport.connectToAllPeers();
   }, 2_000);
+
+  // ── Step 9: Register Web UI HTTP routes ─────────────────
+  // Provides REST endpoints for managing federation from a web UI.
+  // Requires a gateway auth token to be set.
+  if (opts.gatewayToken && opts.httpServers.length > 0) {
+    registerFederationWebRoutes({
+      server: opts.httpServers[0],
+      federationNode: node,
+      config,
+      gatewayToken: opts.gatewayToken,
+    });
+    log.info("federation web UI routes registered");
+  }
 
   // ── Done ────────────────────────────────────────────────
   log.info("federation initialization complete");

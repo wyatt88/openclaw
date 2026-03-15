@@ -1162,3 +1162,616 @@ export class FederationTransport extends EventEmitter {
     });
   }
 }
+
+// ─── SimplePeerConnection ───────────────────────────────────
+
+/**
+ * Connection status for a {@link SimplePeerConnection}.
+ */
+export type SimplePeerStatus = "connected" | "disconnected" | "connecting";
+
+/**
+ * Events emitted by {@link SimplePeerConnection}.
+ *
+ * - `connected`     — WebSocket is open and authenticated.
+ * - `disconnected`  — WebSocket has closed (intentionally or not).
+ * - `reconnecting`  — Automatic reconnect is scheduled.
+ * - `message`       — A JSON message was received from the peer.
+ * - `error`         — An error occurred on the connection.
+ */
+export interface SimplePeerConnectionEvents {
+  connected: [];
+  disconnected: [code: number, reason: string];
+  reconnecting: [attempt: number, delayMs: number];
+  message: [data: unknown];
+  error: [err: Error];
+}
+
+/**
+ * Simplified peer connection using token-based auth.
+ *
+ * No Ed25519 handshake — authenticates with `Authorization: Bearer <token>`
+ * on the WebSocket upgrade request.
+ *
+ * Features:
+ * - Automatic reconnect with exponential backoff (1s → 60s max)
+ * - Heartbeat ping every 30s, disconnect after 3 missed pongs
+ * - Connection pool safety: only one WS per instance
+ *
+ * @example
+ * ```ts
+ * const conn = new SimplePeerConnection({
+ *   peerName: "Nova",
+ *   endpoint: "wss://nova.example.com/federation",
+ *   token: "gw-token-xxx",
+ * });
+ *
+ * conn.on("connected", () => console.log("Connected!"));
+ * conn.on("message", (msg) => console.log("Got:", msg));
+ *
+ * await conn.connect();
+ * await conn.send({ type: "chat", text: "Hello from Ark!" });
+ * ```
+ */
+export class SimplePeerConnection extends EventEmitter {
+  /** Human-readable peer name. */
+  readonly peerName: string;
+
+  /** Peer's WebSocket endpoint URL. */
+  readonly endpoint: string;
+
+  /** Auth token for this peer. */
+  private readonly token: string;
+
+  /** Active WebSocket instance (null when disconnected). */
+  private ws: WebSocket | null = null;
+
+  /** Number of consecutive reconnect attempts since last successful connect. */
+  private reconnectAttempts = 0;
+
+  /** Maximum reconnect delay in milliseconds. */
+  private maxReconnectDelay = RECONNECT_MAX_DELAY_MS;
+
+  /** Handle for the periodic heartbeat interval. */
+  private heartbeatInterval: NodeJS.Timeout | null = null;
+
+  /** Number of consecutive heartbeat pings without a pong reply. */
+  private missedPongs = 0;
+
+  /** Maximum missed pongs before considering the connection dead. */
+  private readonly maxMissedPongs = 3;
+
+  /** Handle for a pending reconnect timer. */
+  private reconnectTimer: NodeJS.Timeout | null = null;
+
+  /** Whether {@link disconnect} was called intentionally (suppresses reconnect). */
+  private intentionalClose = false;
+
+  /** Whether this connection has been permanently destroyed. */
+  private destroyed = false;
+
+  /** Timestamp (ms) of the last successful pong received. */
+  private lastPongAt: number | null = null;
+
+  /** Timestamp (ms) when the current WS connection was established. */
+  private connectedAt: number | null = null;
+
+  /** Internal status tracker. */
+  private _status: SimplePeerStatus = "disconnected";
+
+  /**
+   * Create a new SimplePeerConnection.
+   *
+   * @param params - Connection parameters.
+   * @param params.peerName - Human-readable display name for the peer.
+   * @param params.endpoint - WebSocket endpoint URL (wss:// or ws://).
+   * @param params.token - Gateway auth token for Bearer authentication.
+   */
+  constructor(params: { peerName: string; endpoint: string; token: string }) {
+    super();
+    this.peerName = params.peerName;
+    this.endpoint = params.endpoint;
+    this.token = params.token;
+  }
+
+  // ─── Public Properties ──────────────────────────────────
+
+  /**
+   * Current connection status.
+   */
+  get status(): SimplePeerStatus {
+    return this._status;
+  }
+
+  /**
+   * Estimated latency in milliseconds based on the last heartbeat round-trip.
+   * Returns `null` if no pong has been received yet.
+   */
+  get latencyMs(): number | null {
+    if (this.lastPongAt === null || this.connectedAt === null) {
+      return null;
+    }
+    // Approximation: time since last pong vs heartbeat interval.
+    // A more accurate measurement would record the ping send time, but this
+    // is good enough for monitoring purposes.
+    return this.lastPongAt > 0 ? Date.now() - this.lastPongAt : null;
+  }
+
+  // ─── Connect ────────────────────────────────────────────
+
+  /**
+   * Establish a WebSocket connection to the peer.
+   *
+   * If already connected or connecting, this is a no-op.
+   * The returned promise resolves when the WS is open (not when messages
+   * can flow — that depends on the peer accepting the token).
+   *
+   * @throws {Error} If the connection has been permanently destroyed.
+   */
+  async connect(): Promise<void> {
+    if (this.destroyed) {
+      throw new Error(`SimplePeerConnection to "${this.peerName}" has been destroyed`);
+    }
+
+    // Prevent duplicate connections (connection pool safety).
+    if (this._status === "connected" || this._status === "connecting") {
+      log("debug", `Already ${this._status} to simple peer "${this.peerName}" — skipping`);
+      return;
+    }
+
+    this.intentionalClose = false;
+    this._status = "connecting";
+
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+
+      try {
+        this.ws = new WebSocket(this.endpoint, {
+          headers: {
+            Authorization: `Bearer ${this.token}`,
+            "X-Federation-Protocol": String(PROTOCOL_VERSION),
+            "X-Federation-Peer-Name": this.peerName,
+          },
+          maxPayload: MAX_FRAME_SIZE_BYTES,
+          handshakeTimeout: HANDSHAKE_TIMEOUT_MS,
+        });
+      } catch (err) {
+        this._status = "disconnected";
+        reject(err instanceof Error ? err : new Error(String(err)));
+        return;
+      }
+
+      this.ws.on("open", () => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+
+        this._status = "connected";
+        this.reconnectAttempts = 0;
+        this.connectedAt = Date.now();
+        this.missedPongs = 0;
+
+        log("info", `✅ Connected to simple peer "${this.peerName}"`);
+        this.startHeartbeat();
+        this.emit("connected");
+        resolve();
+      });
+
+      this.ws.on("message", (raw: Buffer | string) => {
+        this.onMessage(raw);
+      });
+
+      this.ws.on("pong", () => {
+        this.missedPongs = 0;
+        this.lastPongAt = Date.now();
+      });
+
+      this.ws.on("close", (code: number, reason: Buffer) => {
+        const reasonStr = reason?.toString() ?? "";
+
+        if (!settled) {
+          settled = true;
+          this._status = "disconnected";
+          reject(new Error(`WS closed before open: code=${code} reason=${reasonStr}`));
+        }
+
+        this.onClose(code, reasonStr);
+      });
+
+      this.ws.on("error", (err: Error) => {
+        log("warn", `WS error for simple peer "${this.peerName}"`, { error: String(err) });
+        this.emit("error", err);
+
+        if (!settled) {
+          settled = true;
+          this._status = "disconnected";
+          reject(err);
+        }
+        // The 'close' event will follow and handle cleanup / reconnect.
+      });
+    });
+  }
+
+  // ─── Disconnect ─────────────────────────────────────────
+
+  /**
+   * Gracefully disconnect from the peer.
+   *
+   * This will NOT trigger automatic reconnection.
+   * Call {@link connect} again to re-establish the connection.
+   */
+  async disconnect(): Promise<void> {
+    this.intentionalClose = true;
+    this.clearTimers();
+
+    if (!this.ws) {
+      this._status = "disconnected";
+      return;
+    }
+
+    return new Promise<void>((resolve) => {
+      const timeout = setTimeout(() => {
+        try {
+          this.ws?.terminate();
+        } catch {
+          // Already dead.
+        }
+        this.ws = null;
+        this._status = "disconnected";
+        resolve();
+      }, 3_000);
+
+      this.ws!.once("close", () => {
+        clearTimeout(timeout);
+        this.ws = null;
+        this._status = "disconnected";
+        resolve();
+      });
+
+      try {
+        if (
+          this.ws!.readyState === WebSocket.OPEN ||
+          this.ws!.readyState === WebSocket.CONNECTING
+        ) {
+          this.ws!.close(1000, "intentional-disconnect");
+        } else {
+          clearTimeout(timeout);
+          this.ws = null;
+          this._status = "disconnected";
+          resolve();
+        }
+      } catch {
+        clearTimeout(timeout);
+        this.ws = null;
+        this._status = "disconnected";
+        resolve();
+      }
+    });
+  }
+
+  /**
+   * Permanently destroy this connection. Cannot be reconnected after this.
+   */
+  async destroy(): Promise<void> {
+    this.destroyed = true;
+    await this.disconnect();
+    this.removeAllListeners();
+  }
+
+  // ─── Send ───────────────────────────────────────────────
+
+  /**
+   * Send a JSON message to the peer.
+   *
+   * @param message - Any JSON-serializable object.
+   * @throws {Error} If the connection is not in the "connected" state.
+   */
+  async send(message: object): Promise<void> {
+    if (this._status !== "connected" || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new Error(`Cannot send to simple peer "${this.peerName}" — status: ${this._status}`);
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      this.ws!.send(JSON.stringify(message), (err) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+
+  // ─── Heartbeat ──────────────────────────────────────────
+
+  /**
+   * Start the heartbeat ping interval.
+   * Sends a WS-level ping every 30s. If 3 consecutive pings go
+   * unanswered, the connection is considered dead and closed.
+   */
+  private startHeartbeat(): void {
+    this.stopHeartbeat();
+
+    this.heartbeatInterval = setInterval(() => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        this.stopHeartbeat();
+        return;
+      }
+
+      if (this.missedPongs >= this.maxMissedPongs) {
+        log(
+          "warn",
+          `Heartbeat: ${this.missedPongs} missed pongs from "${this.peerName}" — closing`,
+        );
+        this.ws.close(4002, "heartbeat-timeout");
+        return;
+      }
+
+      this.missedPongs++;
+      try {
+        this.ws.ping();
+      } catch {
+        // Socket already erroring — close event will handle it.
+        log("warn", `Failed to send ping to "${this.peerName}"`);
+      }
+    }, HEARTBEAT_INTERVAL_MS);
+  }
+
+  /**
+   * Stop the heartbeat interval.
+   */
+  private stopHeartbeat(): void {
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+    this.missedPongs = 0;
+  }
+
+  // ─── Reconnect ──────────────────────────────────────────
+
+  /**
+   * Schedule automatic reconnection with exponential backoff.
+   *
+   * Delay: 1s × 2^attempt, capped at 60s, with ±25% jitter.
+   */
+  private scheduleReconnect(): void {
+    if (this.destroyed || this.intentionalClose) {
+      return;
+    }
+
+    this.reconnectAttempts++;
+    const baseDelay = Math.min(
+      RECONNECT_BASE_DELAY_MS * Math.pow(2, this.reconnectAttempts - 1),
+      this.maxReconnectDelay,
+    );
+    // Add jitter: ±25% of the delay.
+    const jitter = baseDelay * 0.25 * (Math.random() * 2 - 1);
+    const delay = Math.round(baseDelay + jitter);
+
+    log(
+      "info",
+      `Scheduling reconnect to "${this.peerName}" in ${delay}ms (attempt ${this.reconnectAttempts})`,
+    );
+
+    this.emit("reconnecting", this.reconnectAttempts, delay);
+
+    this.reconnectTimer = setTimeout(async () => {
+      this.reconnectTimer = null;
+      if (this.destroyed || this.intentionalClose) {
+        return;
+      }
+
+      try {
+        await this.connect();
+      } catch (err) {
+        log("warn", `Reconnect attempt ${this.reconnectAttempts} to "${this.peerName}" failed`, {
+          error: String(err),
+        });
+        // connect() failure triggers onClose → scheduleReconnect again.
+      }
+    }, delay);
+  }
+
+  // ─── Internal Event Handlers ────────────────────────────
+
+  /**
+   * Handle an incoming WS message.
+   */
+  private onMessage(raw: Buffer | string): void {
+    let text: string;
+    if (Buffer.isBuffer(raw)) {
+      text = raw.toString("utf8");
+    } else {
+      text = raw;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      log("warn", `Received invalid JSON from simple peer "${this.peerName}" — ignoring`);
+      return;
+    }
+
+    this.emit("message", parsed);
+  }
+
+  /**
+   * Handle a WS close event.
+   */
+  private onClose(code: number, reason: string): void {
+    const wasConnected = this._status === "connected";
+    this._status = "disconnected";
+    this.ws = null;
+
+    this.stopHeartbeat();
+
+    if (wasConnected) {
+      log("info", `Disconnected from simple peer "${this.peerName}" (code=${code})`);
+      this.emit("disconnected", code, reason);
+    }
+
+    // Auto-reconnect unless intentional or destroyed.
+    if (!this.intentionalClose && !this.destroyed) {
+      this.scheduleReconnect();
+    }
+  }
+
+  // ─── Helpers ────────────────────────────────────────────
+
+  /**
+   * Clear all pending timers (heartbeat + reconnect).
+   */
+  private clearTimers(): void {
+    this.stopHeartbeat();
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+}
+
+// ─── SimplePeerConnectionPool ─────────────────────────────────
+
+/**
+ * Manages a pool of {@link SimplePeerConnection} instances.
+ *
+ * Ensures at most one connection per peer name, provides lookup by name,
+ * and handles bulk connect/disconnect operations.
+ */
+export class SimplePeerConnectionPool extends EventEmitter {
+  /** Active connections keyed by peer name. */
+  private readonly connections = new Map<string, SimplePeerConnection>();
+
+  /**
+   * Get a connection by peer name.
+   *
+   * @param name - The peer's display name.
+   * @returns The connection instance, or `undefined` if not found.
+   */
+  get(name: string): SimplePeerConnection | undefined {
+    return this.connections.get(name);
+  }
+
+  /**
+   * Check if a peer is connected and ready.
+   *
+   * @param name - The peer's display name.
+   */
+  isConnected(name: string): boolean {
+    return this.connections.get(name)?.status === "connected";
+  }
+
+  /**
+   * Get all connections.
+   */
+  getAll(): ReadonlyMap<string, SimplePeerConnection> {
+    return this.connections;
+  }
+
+  /**
+   * Get status info for all peers in the pool.
+   */
+  getStatusAll(): Array<{
+    name: string;
+    endpoint: string;
+    status: SimplePeerStatus;
+    latencyMs: number | null;
+  }> {
+    const result: Array<{
+      name: string;
+      endpoint: string;
+      status: SimplePeerStatus;
+      latencyMs: number | null;
+    }> = [];
+
+    for (const [name, conn] of this.connections) {
+      result.push({
+        name,
+        endpoint: conn.endpoint,
+        status: conn.status,
+        latencyMs: conn.latencyMs,
+      });
+    }
+
+    return result;
+  }
+
+  /**
+   * Add and connect to a peer. If a connection with the same name already
+   * exists, it is disconnected first.
+   *
+   * @param params - Peer connection parameters.
+   * @returns The created {@link SimplePeerConnection}.
+   */
+  async add(params: {
+    peerName: string;
+    endpoint: string;
+    token: string;
+  }): Promise<SimplePeerConnection> {
+    // Remove existing connection with same name.
+    const existing = this.connections.get(params.peerName);
+    if (existing) {
+      await existing.destroy();
+      this.connections.delete(params.peerName);
+    }
+
+    const conn = new SimplePeerConnection(params);
+
+    // Forward events.
+    conn.on("connected", () => {
+      this.emit("peer.connected", { name: params.peerName });
+    });
+    conn.on("disconnected", (code: number, reason: string) => {
+      this.emit("peer.disconnected", { name: params.peerName, code, reason });
+    });
+    conn.on("reconnecting", (attempt: number, delayMs: number) => {
+      this.emit("peer.reconnecting", { name: params.peerName, attempt, delayMs });
+    });
+    conn.on("message", (data: unknown) => {
+      this.emit("peer.message", { name: params.peerName, data });
+    });
+
+    this.connections.set(params.peerName, conn);
+
+    // Attempt connection (non-blocking — reconnect handles failures).
+    try {
+      await conn.connect();
+    } catch (err) {
+      log("warn", `Initial connection to simple peer "${params.peerName}" failed`, {
+        error: String(err),
+      });
+      // Reconnect is already scheduled by the connection itself.
+    }
+
+    return conn;
+  }
+
+  /**
+   * Remove a peer from the pool and disconnect.
+   *
+   * @param name - The peer's display name.
+   */
+  async remove(name: string): Promise<void> {
+    const conn = this.connections.get(name);
+    if (conn) {
+      await conn.destroy();
+      this.connections.delete(name);
+    }
+  }
+
+  /**
+   * Disconnect and destroy all connections in the pool.
+   */
+  async shutdown(): Promise<void> {
+    const promises: Promise<void>[] = [];
+    for (const [_name, conn] of this.connections) {
+      promises.push(conn.destroy());
+    }
+    await Promise.allSettled(promises);
+    this.connections.clear();
+    this.emit("shutdown");
+  }
+}

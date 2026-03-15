@@ -38,9 +38,9 @@ export type FederationLocalIdentity = FederationIdentity & {
 // ─── Trust ──────────────────────────────────────────────────
 
 export type TrustLevel =
-  | "direct"    // Owner explicitly verified this peer (scanned QR / exchanged keys)
-  | "vouched"   // A directly-trusted peer vouched for this one
-  | "unknown";  // No trust established
+  | "direct" // Owner explicitly verified this peer (scanned QR / exchanged keys)
+  | "vouched" // A directly-trusted peer vouched for this one
+  | "unknown"; // No trust established
 
 /**
  * A known peer in the trust store.
@@ -106,14 +106,14 @@ export type CapabilityGrant = {
 };
 
 export type FederationCapability =
-  | "chat"              // Can send/receive chat messages
-  | "calendar.read"     // Can query calendar
-  | "calendar.write"    // Can create calendar events
-  | "weather"           // Can query weather
-  | "location.city"     // Can know city-level location
-  | "tasks.read"        // Can query shared tasks
-  | "tasks.write"       // Can create shared tasks
-  | "introduce";        // Can introduce other peers (Web of Trust)
+  | "chat" // Can send/receive chat messages
+  | "calendar.read" // Can query calendar
+  | "calendar.write" // Can create calendar events
+  | "weather" // Can query weather
+  | "location.city" // Can know city-level location
+  | "tasks.read" // Can query shared tasks
+  | "tasks.write" // Can create shared tasks
+  | "introduce"; // Can introduce other peers (Web of Trust)
 
 // ─── Messages ───────────────────────────────────────────────
 
@@ -137,16 +137,19 @@ export type SignedMessage = {
  * Message payload types.
  */
 export type FederationMessageType =
-  | "hello"              // Handshake initiation
-  | "hello.ack"          // Handshake response
-  | "hello.verified"     // Handshake completion
-  | "chat"               // Chat message
-  | "chat.response"      // Chat response
-  | "capability.grant"   // Capability grant
-  | "capability.revoke"  // Capability revocation
-  | "introduce"          // Peer introduction (Web of Trust)
-  | "ping"               // Keepalive
-  | "pong";              // Keepalive response
+  | "hello" // Handshake initiation
+  | "hello.ack" // Handshake response
+  | "hello.verified" // Handshake completion
+  | "chat" // Chat message
+  | "chat.response" // Chat response
+  | "delegate" // Delegate a task to peer
+  | "delegate.response" // Delegate task response
+  | "broadcast" // Broadcast message to all peers
+  | "capability.grant" // Capability grant
+  | "capability.revoke" // Capability revocation
+  | "introduce" // Peer introduction (Web of Trust)
+  | "ping" // Keepalive
+  | "pong"; // Keepalive response
 
 export type FederationMessagePayload = {
   type: FederationMessageType;
@@ -159,7 +162,7 @@ export type HelloMessage = {
   type: "hello";
   data: {
     identity: FederationIdentity;
-    challenge: string;         // Random 32-byte hex
+    challenge: string; // Random 32-byte hex
     protocolVersion: number;
     timestamp: number;
   };
@@ -213,6 +216,57 @@ export type ChatResponseMessage = {
   };
 };
 
+// ─── Delegate ───────────────────────────────────────────────
+
+/**
+ * Delegate a specific task to a peer Agent and wait for the result.
+ * Unlike chat, delegate implies a structured request/response pattern.
+ */
+export type DelegateMessage = {
+  type: "delegate";
+  data: {
+    /** Unique task ID for correlation. */
+    taskId: string;
+    /** Description of the task to perform. */
+    task: string;
+    /** Optional timeout hint (ms) for the peer. */
+    timeoutMs?: number;
+  };
+};
+
+/**
+ * Response to a delegate request.
+ */
+export type DelegateResponseMessage = {
+  type: "delegate.response";
+  data: {
+    /** Task ID from the original delegate request. */
+    taskId: string;
+    /** Result text from the peer Agent. */
+    result: string;
+    /** Whether the task completed successfully. */
+    success: boolean;
+    /** Error message if the task failed. */
+    error?: string;
+  };
+};
+
+// ─── Broadcast ──────────────────────────────────────────────
+
+/**
+ * Broadcast a message to all connected peers.
+ * No response is expected.
+ */
+export type BroadcastMessage = {
+  type: "broadcast";
+  data: {
+    /** The broadcast message text. */
+    text: string;
+    /** Optional topic/channel for filtering. */
+    topic?: string;
+  };
+};
+
 // ─── Introduce (Web of Trust) ───────────────────────────────
 
 export type IntroduceMessage = {
@@ -236,7 +290,7 @@ export type IntroduceMessage = {
 export const FEDERATION_TOOL_ALLOWLIST: readonly string[] = [
   "web_search",
   "web_fetch",
-  "message",        // Notify owner only
+  "message", // Notify owner only
   "session_status",
 ] as const;
 
@@ -273,6 +327,25 @@ This Agent belongs to a DIFFERENT person.
 - Share your owner's schedule, contacts, or preferences without approval
 `.trim();
 
+// ─── Simple Peer (token-based auth) ─────────────────────────
+
+/**
+ * Simplified peer configuration using token-based authentication.
+ * No Ed25519 key exchange needed — uses the peer's gateway auth token
+ * for a lightweight "just works" setup. Less secure than the full
+ * Ed25519 handshake, but much easier to configure.
+ */
+export type SimplePeerConfig = {
+  /** Human-readable display name for this peer. */
+  name: string;
+  /** WebSocket or HTTPS endpoint for the peer (wss:// or https://). */
+  endpoint: string;
+  /** Gateway auth token for authenticating with this peer. */
+  token: string;
+  /** Capabilities to grant this peer. Defaults to ["chat"]. */
+  capabilities?: FederationCapability[];
+};
+
 // ─── Config ─────────────────────────────────────────────────
 
 export type FederationConfig = {
@@ -280,7 +353,9 @@ export type FederationConfig = {
   enabled: boolean;
   /** Display name for this instance */
   instanceName: string;
-  /** Pre-approved peers (from config file) */
+  /** Public WSS/HTTPS endpoint for this instance (used in pairing codes and peer discovery). */
+  endpoint?: string;
+  /** Pre-approved peers (from config file) — advanced mode with Ed25519 public keys. */
   trustedPeers?: Array<{
     /** Peer's public key (PEM or base64url) */
     publicKey: string;
@@ -293,6 +368,8 @@ export type FederationConfig = {
     /** Rate limits */
     rateLimit?: CapabilityGrant["rateLimit"];
   }>;
+  /** Simplified peers using token-based authentication (no key exchange needed). */
+  peers?: SimplePeerConfig[];
   /** Rate limit defaults for new peers */
   defaultRateLimit?: CapabilityGrant["rateLimit"];
   /** Allow peers to introduce other peers (Web of Trust) */
@@ -315,7 +392,10 @@ export type FederationPeerHealth = {
   latencyMs?: number;
   lastSeenAt?: number;
   capabilities: FederationCapability[];
+  endpoint?: string;
   error?: string;
+  /** Whether this peer uses token-based (simplified) authentication. */
+  tokenAuth?: boolean;
 };
 
 export type FederationStatus = {
