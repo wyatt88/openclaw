@@ -29,6 +29,9 @@
 
 import * as crypto from "node:crypto";
 import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { resolveStateDir } from "../config/paths.js";
 import {
   derivePeerIdFromPublicKey,
   signPayload,
@@ -338,11 +341,66 @@ export class PairingManager extends EventEmitter {
   private readonly trustStore: TrustStore;
   private activeSessions: Map<string, PairingSession> = new Map();
   private sessionTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
+  /** Pending OC- pairing codes keyed by challenge nonce (in-memory cache). */
+  private pendingPairingCodes: Map<string, PairingCodeData> = new Map();
+  /** File path for persisting pending pairing codes (shared between CLI and Gateway). */
+  private readonly pendingCodesPath: string;
 
   constructor(params: { identity: FederationLocalIdentity; trustStore: TrustStore }) {
     super();
     this.identity = params.identity;
     this.trustStore = params.trustStore;
+    this.pendingCodesPath = path.join(
+      resolveStateDir(),
+      "federation",
+      "pending-pairing-codes.json",
+    );
+  }
+
+  // ─── Pending Code Persistence ─────────────────────────
+
+  /** Load pending codes from disk, merging with in-memory state. */
+  private loadPendingCodes(): void {
+    try {
+      if (!fs.existsSync(this.pendingCodesPath)) {
+        return;
+      }
+      const raw = fs.readFileSync(this.pendingCodesPath, "utf8");
+      const stored = JSON.parse(raw) as Record<string, PairingCodeData>;
+      const now = Date.now();
+      for (const [challenge, data] of Object.entries(stored)) {
+        // Skip expired codes
+        if (now > data.expiresAt) {
+          continue;
+        }
+        // Don't overwrite in-memory entries
+        if (!this.pendingPairingCodes.has(challenge)) {
+          this.pendingPairingCodes.set(challenge, data);
+        }
+      }
+    } catch {
+      // Ignore read errors — start with in-memory state only
+    }
+  }
+
+  /** Save all non-expired pending codes to disk. */
+  private savePendingCodes(): void {
+    try {
+      const dir = path.dirname(this.pendingCodesPath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      const now = Date.now();
+      const stored: Record<string, PairingCodeData> = {};
+      for (const [challenge, data] of this.pendingPairingCodes) {
+        if (now <= data.expiresAt) {
+          stored[challenge] = data;
+        }
+      }
+      fs.writeFileSync(this.pendingCodesPath, JSON.stringify(stored, null, 2), "utf8");
+    } catch {
+      // Non-fatal — codes still work in-memory for same process
+    }
   }
 
   // ─── Method A: Setup Code Pairing ─────────────────────
@@ -697,7 +755,145 @@ export class PairingManager extends EventEmitter {
       instanceName: this.identity.name,
     };
 
+    // Store pending code so handleCodeAcceptRequest can verify it later
+    this.pendingPairingCodes.set(challenge, data);
+    this.savePendingCodes();
+
+    // Auto-cleanup when code expires
+    setTimeout(
+      () => {
+        this.pendingPairingCodes.delete(challenge);
+        this.savePendingCodes();
+      },
+      expiresAt - Date.now() + 1000,
+    );
+
     return { code: encodePairingCode(data), data };
+  }
+
+  /**
+   * Handle an incoming code-accept request from a peer that decoded our OC- code.
+   *
+   * Called by the Gateway HTTP server when POST /federation/pair/code-accept arrives.
+   *
+   * Flow:
+   *   1. Verify the challengeResponse matches a pending code's challenge
+   *   2. Verify the peer's identity (peerId matches publicKey)
+   *   3. Sign the peer's challenge (prove our identity)
+   *   4. Store the peer in trust store
+   *   5. Return our identity + challengeResponse + grant
+   */
+  handleCodeAcceptRequest(payload: {
+    identity: FederationIdentity;
+    endpoint: PeerEndpoint;
+    challengeResponse: string;
+    challenge: string;
+    timestamp: number;
+  }):
+    | {
+        ok: true;
+        identity: FederationIdentity;
+        endpoint: PeerEndpoint;
+        challengeResponse: string;
+        grant: CapabilityGrant;
+      }
+    | { ok: false; error: string } {
+    // Validate timestamp (reject stale requests)
+    const age = Date.now() - payload.timestamp;
+    if (Math.abs(age) > 5 * 60 * 1000) {
+      return { ok: false, error: "Timestamp out of range (>5 min skew)" };
+    }
+
+    // Verify peerId matches public key
+    const derivedPeerId = derivePeerIdFromPublicKey(payload.identity.publicKeyPem);
+    if (derivedPeerId !== payload.identity.peerId) {
+      return { ok: false, error: "Peer ID does not match public key" };
+    }
+
+    // Load pending codes from disk (may have been created by CLI in another process)
+    this.loadPendingCodes();
+
+    // Find the pending code by verifying challengeResponse against each pending challenge
+    let matchedChallenge: string | null = null;
+    for (const [challenge, codeData] of this.pendingPairingCodes) {
+      // Check expiry
+      if (Date.now() > codeData.expiresAt) {
+        this.pendingPairingCodes.delete(challenge);
+        continue;
+      }
+      // Verify the peer signed our challenge correctly
+      if (verifySignature(payload.identity.publicKeyPem, challenge, payload.challengeResponse)) {
+        matchedChallenge = challenge;
+        break;
+      }
+    }
+
+    if (!matchedChallenge) {
+      return { ok: false, error: "Invalid challenge response — no matching pairing code found" };
+    }
+
+    // Consume the pairing code (single-use)
+    this.pendingPairingCodes.delete(matchedChallenge);
+    this.savePendingCodes();
+
+    // Check if already trusted
+    const existing = this.trustStore.getPeer(payload.identity.peerId);
+    if (existing?.trust === "direct") {
+      return {
+        ok: false,
+        error: `Peer ${formatPeerId(payload.identity.peerId)} is already trusted`,
+      };
+    }
+
+    // Sign the peer's challenge to prove our identity
+    const challengeResponse = signPayload(this.identity.privateKeyPem, payload.challenge);
+
+    // Create capability grant
+    const grant = createCapabilityGrant(this.identity, {
+      grantee: payload.identity.peerId,
+      capabilities: [...DEFAULT_CAPABILITIES],
+    });
+
+    // Store peer in trust store
+    try {
+      this.trustStore.addDirectPeer({
+        identity: payload.identity,
+        endpoint: payload.endpoint,
+        grant,
+      });
+    } catch (err) {
+      return {
+        ok: false,
+        error: `Failed to store peer: ${err instanceof Error ? err.message : String(err)}`,
+      };
+    }
+
+    const result: PairingResult = {
+      peerId: payload.identity.peerId,
+      peerName: payload.identity.name,
+      peerIdentity: payload.identity,
+      peerEndpoint: payload.endpoint,
+      grantedCapabilities: grant.capabilities,
+    };
+
+    this.emit("session:completed", result);
+
+    return {
+      ok: true,
+      identity: {
+        peerId: this.identity.peerId,
+        publicKeyPem: this.identity.publicKeyPem,
+        name: this.identity.name,
+      },
+      endpoint: this.getLocalEndpoint(),
+      challengeResponse,
+      grant,
+    };
+  }
+
+  /** Get the count of pending pairing codes. */
+  get pendingCodeCount(): number {
+    return this.pendingPairingCodes.size;
   }
 
   /**
@@ -907,6 +1103,8 @@ export class PairingManager extends EventEmitter {
     }
     this.sessionTimers.clear();
     this.activeSessions.clear();
+    this.pendingPairingCodes.clear();
+    this.savePendingCodes();
   }
 
   // ─── Helpers ──────────────────────────────────────────

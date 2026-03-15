@@ -939,6 +939,23 @@ export async function startGatewayServer(
     }));
   }
 
+  // ── Federation subsystem ──────────────────────────────────
+  let federationHandle: Awaited<
+    ReturnType<typeof import("../federation/index.js").initFederation>
+  > = null;
+  if (!minimalTestGateway && cfgAtStart.federation?.enabled) {
+    try {
+      const { initFederation } = await import("../federation/index.js");
+      federationHandle = await initFederation({
+        config: cfgAtStart.federation,
+        httpServers,
+      });
+      log.info("federation subsystem initialized");
+    } catch (err) {
+      log.warn(`federation init failed: ${String(err)}`);
+    }
+  }
+
   // Run gateway_start plugin hook (fire-and-forget)
   if (!minimalTestGateway) {
     const hookRunner = getGlobalHookRunner();
@@ -1063,6 +1080,7 @@ export async function startGatewayServer(
       authRateLimiter?.dispose();
       browserAuthRateLimiter.dispose();
       channelHealthMonitor?.stop();
+      federationHandle?.shutdown().catch(() => {});
       clearSecretsRuntimeSnapshot();
       await close(opts);
     },
