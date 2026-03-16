@@ -953,6 +953,7 @@ export async function startGatewayServer(
       federationHandle = await initFederation({
         config: cfgAtStart.federation,
         httpServers,
+        gatewayToken: resolvedAuth.token,
       });
       // Merge federation RPC handlers into the live handler map so
       // Gateway WS clients can call federation.status, federation.listPeers, etc.
