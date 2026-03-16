@@ -145,6 +145,9 @@ export class AutoConnector {
       return;
     }
 
+    // Reload trust store from disk in case peers were added externally
+    this.trustStore.reload();
+
     const peers = this.trustStore.listPeers();
     let attempted = 0;
 
@@ -173,6 +176,9 @@ export class AutoConnector {
     if (this.destroyed) {
       return;
     }
+
+    // Reload trust store from disk to pick up peers added by CLI pairing
+    this.trustStore.reload();
 
     const peers = this.trustStore.listPeers();
     let newPeers = 0;

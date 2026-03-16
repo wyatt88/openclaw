@@ -106,6 +106,44 @@ export class TrustStore {
 
   // ─── Peer Management ────────────────────────────────────
 
+  /**
+   * Reload the trust store from disk, merging any new peers added by
+   * other processes (e.g. CLI pairing while Gateway is running).
+   * Preserves in-memory `connected` state for existing peers.
+   */
+  reload(): void {
+    try {
+      if (!fs.existsSync(this.storePath)) {
+        return;
+      }
+      const raw = fs.readFileSync(this.storePath, "utf8");
+      const stored = JSON.parse(raw) as StoredTrustStore;
+      if (stored?.version !== 1) {
+        return;
+      }
+      for (const [peerId, peer] of Object.entries(stored.peers)) {
+        const existing = this.peers.get(peerId);
+        if (existing) {
+          // Update endpoint/capabilities but keep connected state
+          existing.endpoint = peer.endpoint;
+          existing.identity = peer.identity;
+          existing.grantedCapabilities = peer.grantedCapabilities;
+        } else {
+          // New peer discovered
+          this.peers.set(peerId, { ...peer, connected: false });
+        }
+      }
+      // Remove peers that were revoked on disk
+      for (const peerId of this.peers.keys()) {
+        if (!stored.peers[peerId]) {
+          this.peers.delete(peerId);
+        }
+      }
+    } catch {
+      // Ignore read errors
+    }
+  }
+
   getPeer(peerId: string): TrustedPeer | undefined {
     return this.peers.get(peerId);
   }
