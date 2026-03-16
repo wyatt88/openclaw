@@ -14,6 +14,8 @@
 
 import chalk from "chalk";
 import type { Command } from "commander";
+import { callGateway } from "../gateway/call.js";
+import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
 import { loadOrCreateFederationIdentity, formatPeerId } from "./crypto.js";
 import { PairingServer, initiatePairingToServer } from "./pairing-server.js";
 import {
@@ -173,6 +175,38 @@ function resolvePeerId(store: TrustStore, idOrPrefix: string): string | null {
   return null;
 }
 
+// ─── Gateway RPC Helper ─────────────────────────────────────
+
+type GatewayRpcOpts = {
+  url?: string;
+  token?: string;
+};
+
+/**
+ * Call the running Gateway via RPC to get live federation status.
+ * Falls back to local trust store if the Gateway is unreachable.
+ */
+async function callFederationRpc(
+  method: string,
+  opts?: GatewayRpcOpts,
+  params?: unknown,
+): Promise<{ ok: boolean; [key: string]: unknown } | null> {
+  try {
+    const result = await callGateway({
+      url: opts?.url,
+      token: opts?.token,
+      method,
+      params: params ?? {},
+      timeoutMs: 5_000,
+      clientName: GATEWAY_CLIENT_NAMES.CLI,
+      mode: GATEWAY_CLIENT_MODES.CLI,
+    });
+    return result as { ok: boolean; [key: string]: unknown };
+  } catch {
+    return null;
+  }
+}
+
 // ─── Registration ───────────────────────────────────────────
 
 /**
@@ -189,8 +223,92 @@ export function registerFederationCli(program: Command): void {
     .command("status")
     .description("Show local federation identity, connectivity, and stats")
     .option("--json", "Output as JSON", false)
+    .option("--url <url>", "Gateway WebSocket URL")
+    .option("--token <token>", "Gateway token")
+    .option("--offline", "Read from local trust store only (skip Gateway RPC)", false)
     .action(async (opts) => {
       const identity = getIdentity();
+
+      // Try to get live status from the running Gateway
+      let liveStatus: { ok: boolean; [key: string]: unknown } | null = null;
+      if (!opts.offline) {
+        liveStatus = await callFederationRpc("federation.status", {
+          url: opts.url,
+          token: opts.token,
+        });
+      }
+
+      if (liveStatus?.ok) {
+        // ── Live status from Gateway ──────────────────
+        const status = liveStatus.status as {
+          enabled: boolean;
+          identity: { peerId: string; name: string };
+          peers: Array<{
+            peerId: string;
+            peerIdFull?: string;
+            peerName: string;
+            connected: boolean;
+            trust: string;
+            endpoint?: string;
+            capabilities: string[];
+            lastSeenAt?: number;
+            connectionPhase?: string;
+            connectionDirection?: string;
+          }>;
+          totalConnected: number;
+          totalTrusted: number;
+        };
+        const transportInfo = liveStatus.transport as {
+          activeConnections: number;
+        };
+
+        if (opts.json) {
+          console.log(JSON.stringify(liveStatus, null, 2));
+          return;
+        }
+
+        const peers = status.peers ?? [];
+        const connected = peers.filter((p) => p.connected);
+
+        const statusLabel =
+          connected.length > 0
+            ? chalk.green.bold("ACTIVE")
+            : peers.length > 0
+              ? chalk.yellow.bold("IDLE")
+              : chalk.gray.bold("UNCONFIGURED");
+
+        console.log("");
+        console.log(`  Federation Status: ${statusLabel} ${chalk.dim("(live)")}`);
+        console.log("");
+        console.log(`  ${chalk.dim("Instance:")}   ${chalk.bold(status.identity.name)}`);
+        console.log(`  ${chalk.dim("Peer ID:")}    ${chalk.cyan(status.identity.peerId)}`);
+        console.log(`  ${chalk.dim("Peers:")}      ${connected.length}/${peers.length} connected`);
+        console.log(
+          `  ${chalk.dim("Transport:")}  ${transportInfo?.activeConnections ?? 0} active WS connection(s)`,
+        );
+
+        // Show endpoint if configured
+        const endpoint = process.env.OPENCLAW_FEDERATION_ENDPOINT;
+        if (endpoint) {
+          console.log(`  ${chalk.dim("Endpoint:")}   ${chalk.cyan(endpoint)}`);
+        }
+
+        if (peers.length > 0) {
+          console.log("");
+          console.log(chalk.dim("  Peers:"));
+          for (const peer of peers) {
+            const pStatus = peer.connected ? chalk.green("● connected") : chalk.gray("○ offline");
+            const dir = peer.connectionDirection ? chalk.dim(` [${peer.connectionDirection}]`) : "";
+            console.log(
+              `    ${pStatus}${dir}  ${chalk.bold(peer.peerName)} ${chalk.dim("(" + peer.peerId + ")")}`,
+            );
+          }
+        }
+        console.log("");
+        return;
+      }
+
+      // ── Fallback: local trust store ───────────────────
       const store = getTrustStore();
       const peers = store.listPeers();
       const trusted = peers.filter((p) => p.trust === "direct" || p.trust === "vouched");
@@ -210,6 +328,7 @@ export function registerFederationCli(program: Command): void {
               totalPeers: peers.length,
               totalTrusted: trusted.length,
               totalConnected: connected.length,
+              source: "local",
             },
             null,
             2,
@@ -227,7 +346,9 @@ export function registerFederationCli(program: Command): void {
             : chalk.gray.bold("UNCONFIGURED");
 
       console.log("");
-      console.log(`  Federation Status: ${statusLabel}`);
+      console.log(
+        `  Federation Status: ${statusLabel} ${chalk.dim("(offline — Gateway not reachable)")}`,
+      );
       console.log("");
       console.log(`  ${chalk.dim("Instance:")}   ${chalk.bold(identity.name)}`);
       console.log(`  ${chalk.dim("Peer ID:")}    ${chalk.cyan(formatPeerId(identity.peerId))}`);
@@ -357,7 +478,141 @@ export function registerFederationCli(program: Command): void {
     .description("List all trusted peers in a table view")
     .option("--json", "Output as JSON", false)
     .option("--verbose", "Show full peer details", false)
+    .option("--url <url>", "Gateway WebSocket URL")
+    .option("--token <token>", "Gateway token")
+    .option("--offline", "Read from local trust store only (skip Gateway RPC)", false)
     .action(async (opts) => {
+      // Try to get live status from the running Gateway
+      let livePeers: { ok: boolean; [key: string]: unknown } | null = null;
+      if (!opts.offline) {
+        livePeers = await callFederationRpc("federation.listPeers", {
+          url: opts.url,
+          token: opts.token,
+        });
+      }
+
+      if (livePeers?.ok) {
+        // ── Live data from Gateway ────────────────────
+        const _thisInstance = livePeers.thisInstance as { peerId: string; name: string };
+        const peers = livePeers.peers as Array<{
+          peerId: string;
+          peerIdFull?: string;
+          name: string;
+          trust: string;
+          connected: boolean;
+          endpoint?: string;
+          capabilities: string[];
+          lastSeenAt?: string | null;
+          connectionPhase?: string;
+          connectionDirection?: string;
+          connectedAt?: string | null;
+        }>;
+        const summary = livePeers.summary as {
+          total: number;
+          connected: number;
+          trusted: number;
+        };
+
+        if (opts.json) {
+          console.log(JSON.stringify(livePeers, null, 2));
+          return;
+        }
+
+        if (peers.length === 0) {
+          console.log("");
+          console.log(chalk.gray("  No peers configured."));
+          console.log(
+            chalk.gray("  Run ") +
+              chalk.cyan("openclaw federation pair --generate --endpoint <url>") +
+              chalk.gray(" to start pairing."),
+          );
+          console.log("");
+          return;
+        }
+
+        const connected = summary.connected;
+        const offline = summary.total - connected;
+
+        console.log("");
+        const parts: string[] = [];
+        if (connected > 0) {
+          parts.push(chalk.green(`${connected} connected`));
+        }
+        if (offline > 0) {
+          parts.push(chalk.gray(`${offline} offline`));
+        }
+        console.log(`  Federation Peers (${parts.join(", ")}) ${chalk.dim("— live")}:`);
+        console.log("");
+
+        // Table header
+        const cols = {
+          name: 10,
+          status: 13,
+          endpoint: 38,
+          direction: 10,
+          auth: 9,
+          lastSeen: 12,
+        };
+
+        console.log(
+          chalk.dim("  ") +
+            padRight(chalk.bold("Name"), cols.name) +
+            padRight(chalk.bold("Status"), cols.status) +
+            padRight(chalk.bold("Endpoint"), cols.endpoint) +
+            padRight(chalk.bold("Dir"), cols.direction) +
+            padRight(chalk.bold("Auth"), cols.auth) +
+            chalk.bold("Last Seen"),
+        );
+
+        // Separator
+        console.log(
+          chalk.dim("  ") +
+            chalk.dim("──────".padEnd(cols.name)) +
+            chalk.dim("──────────".padEnd(cols.status)) +
+            chalk.dim("──────────────────────────────".padEnd(cols.endpoint)) +
+            chalk.dim("────────".padEnd(cols.direction)) +
+            chalk.dim("───────".padEnd(cols.auth)) +
+            chalk.dim("──────────"),
+        );
+
+        // Peer rows
+        for (const peer of peers) {
+          const name = chalk.bold(peer.name.slice(0, cols.name - 2));
+          const status = peer.connected ? chalk.green("● connected") : chalk.gray("○ offline");
+          const ep = peer.endpoint ?? chalk.gray("-");
+          const dir = peer.connectionDirection
+            ? chalk.cyan(peer.connectionDirection)
+            : chalk.gray("-");
+          const auth = peer.trust === "direct" ? "ed25519" : peer.trust;
+          const lastSeen = peer.lastSeenAt
+            ? formatTimestamp(new Date(peer.lastSeenAt).getTime())
+            : chalk.gray("never");
+
+          console.log(
+            "  " +
+              padRight(name, cols.name) +
+              padRight(status, cols.status) +
+              padRight(ep.slice(0, cols.endpoint - 2), cols.endpoint) +
+              padRight(dir, cols.direction) +
+              padRight(auth, cols.auth) +
+              lastSeen,
+          );
+
+          if (opts.verbose) {
+            console.log(chalk.dim(`           ID: ${peer.peerIdFull ?? peer.peerId}`));
+            console.log(
+              chalk.dim(`           Trust: ${peer.trust}   Caps: ${peer.capabilities.join(", ")}`),
+            );
+            if (peer.connectionPhase) {
+              console.log(chalk.dim(`           Phase: ${peer.connectionPhase}`));
+            }
+          }
+        }
+        console.log("");
+        return;
+      }
+
+      // ── Fallback: local trust store ───────────────────
       const store = getTrustStore();
       const peers = store.listPeers();
 
@@ -390,7 +645,9 @@ export function registerFederationCli(program: Command): void {
       if (offline > 0) {
         parts.push(chalk.gray(`${offline} offline`));
       }
-      console.log(`  Federation Peers (${parts.join(", ")}):`);
+      console.log(
+        `  Federation Peers (${parts.join(", ")}) ${chalk.dim("— offline (Gateway not reachable)")}:`,
+      );
       console.log("");
 
       // Table header

@@ -15,6 +15,7 @@
 import type http from "node:http";
 import type { GatewayRequestHandlers } from "../gateway/server-methods/types.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { AutoConnector } from "./auto-connector.js";
 import { FederationNode } from "./client.js";
 import { formatPeerId } from "./crypto.js";
 import { PairingManager } from "./pairing.js";
@@ -104,6 +105,8 @@ export type FederationHandle = {
   node: FederationNode;
   /** The FederationTransport instance (WS connections) */
   transport: FederationTransport;
+  /** The AutoConnector for peer lifecycle management */
+  autoConnector: AutoConnector;
   /** The PairingManager for OC- code pairing */
   pairingManager: PairingManager;
   /** Active federation sessions */
@@ -270,6 +273,7 @@ function createGatewayRpcHandlers(
   node: FederationNode,
   transport: FederationTransport,
   sessionManager: FederationSessionManager,
+  autoConnector: AutoConnector,
 ): GatewayRequestHandlers {
   return {
     // ── federation.status ─────────────────────────────────
@@ -277,10 +281,30 @@ function createGatewayRpcHandlers(
       const status = node.getStatus();
       const sessions = sessionManager.listSessions();
       const connections = transport.getConnectionInfo();
+      const detailedPeers = autoConnector.getDetailedStatus();
 
       respond({
         ok: true,
-        status,
+        status: {
+          ...status,
+          // Override peers with live connection state from AutoConnector
+          peers: detailedPeers.map((p) => ({
+            peerId: formatPeerId(p.peerId),
+            peerIdFull: p.peerId,
+            peerName: p.peerName,
+            connected: p.connected,
+            trust: p.trust,
+            endpoint: p.endpoint,
+            capabilities: p.capabilities,
+            lastSeenAt: p.lastSeenAt,
+            connectionPhase: p.connectionPhase,
+            connectionDirection: p.connectionDirection,
+            connectedAt: p.connectedAt,
+          })),
+          totalConnected: detailedPeers.filter((p) => p.connected).length,
+          totalTrusted: detailedPeers.filter((p) => p.trust === "direct" || p.trust === "vouched")
+            .length,
+        },
         transport: {
           activeConnections: transport.activeConnectionCount,
           connections: connections.map((c) => ({
@@ -413,15 +437,20 @@ function createGatewayRpcHandlers(
 
     // ── federation.listPeers ──────────────────────────────
     "federation.listPeers": async ({ respond }) => {
-      const peers = node.trustStore.listPeers().map((peer) => ({
-        peerId: formatPeerId(peer.identity.peerId),
-        name: peer.identity.name,
+      const detailedPeers = autoConnector.getDetailedStatus();
+
+      const peers = detailedPeers.map((peer) => ({
+        peerId: formatPeerId(peer.peerId),
+        peerIdFull: peer.peerId,
+        name: peer.peerName,
         trust: peer.trust,
         connected: peer.connected,
         endpoint: peer.endpoint,
-        capabilities: peer.grantedCapabilities.capabilities,
+        capabilities: peer.capabilities,
         lastSeenAt: peer.lastSeenAt ? new Date(peer.lastSeenAt).toISOString() : null,
-        addedAt: new Date(peer.addedAt).toISOString(),
+        connectionPhase: peer.connectionPhase,
+        connectionDirection: peer.connectionDirection,
+        connectedAt: peer.connectedAt ? new Date(peer.connectedAt).toISOString() : null,
       }));
 
       respond({
@@ -586,15 +615,15 @@ export async function initFederation(
   }
 
   // ── Step 7: Create Gateway RPC handlers ─────────────────
-  const gatewayHandlers = createGatewayRpcHandlers(node, transport, sessionManager);
+  const autoConnector = new AutoConnector({ node, trustStore: node.trustStore, transport });
+  const gatewayHandlers = createGatewayRpcHandlers(node, transport, sessionManager, autoConnector);
   log.info(`federation RPC methods registered: ${Object.keys(gatewayHandlers).join(", ")}`);
 
-  // ── Step 8: Connect to known peers ──────────────────────
-  // Delay slightly to allow the Gateway to finish binding.
-  // The transport handles reconnection with exponential backoff.
-  setTimeout(() => {
-    transport.connectToAllPeers();
-  }, 2_000);
+  // ── Step 8: Start AutoConnector ─────────────────────────
+  // The AutoConnector handles initial connection sweep (with a brief
+  // startup delay) and periodic rescanning for newly added peers.
+  autoConnector.start();
+  log.info("federation auto-connector started");
 
   // ── Step 9: Register Web UI HTTP routes ─────────────────
   // Provides REST endpoints for managing federation from a web UI.
@@ -635,11 +664,13 @@ export async function initFederation(
   return {
     node,
     transport,
+    autoConnector,
     pairingManager,
     sessions: sessionManager.getMap(),
     gatewayHandlers,
     shutdown: async () => {
       log.info("federation shutting down...");
+      autoConnector.shutdown();
       pairingManager.cancelAll();
       sessionManager.dispose();
       await transport.shutdown();
