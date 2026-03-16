@@ -197,7 +197,8 @@ async function callFederationRpc(
       token: opts?.token,
       method,
       params: params ?? {},
-      timeoutMs: 5_000,
+      timeoutMs: 15_000,
+      connectDelayMs: 10_000,
       clientName: GATEWAY_CLIENT_NAMES.CLI,
       mode: GATEWAY_CLIENT_MODES.CLI,
     });
