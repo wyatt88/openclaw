@@ -1035,7 +1035,12 @@ export class FederationTransport extends EventEmitter {
       result.push({
         peerId,
         peerName: peer?.identity.name ?? "unknown",
-        phase: ConnPhase[conn.phase],
+        phase:
+          conn.phase === ConnPhase.Ready
+            ? "Ready"
+            : conn.phase === ConnPhase.Handshaking
+              ? "Handshaking"
+              : "Closed",
         outbound: conn.outbound,
         connectedAt: conn.connectedAt,
         reconnectAttempt: conn.reconnectAttempt,

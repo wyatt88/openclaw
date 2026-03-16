@@ -202,7 +202,8 @@ async function callFederationRpc(
       mode: GATEWAY_CLIENT_MODES.CLI,
     });
     return result as { ok: boolean; [key: string]: unknown };
-  } catch {
+  } catch (err) {
+    console.error(`gateway connect failed: ${String(err)}`);
     return null;
   }
 }
