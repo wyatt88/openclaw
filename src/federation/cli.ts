@@ -627,7 +627,7 @@ async function handlePairGenerate(params: {
   console.log(chalk.dim("  They should run:"));
   console.log("");
   console.log(
-    `    ${chalk.cyan("openclaw federation pair")} --code ${chalk.yellow(code.slice(0, 20) + "...")} --endpoint ${chalk.yellow("wss://their-instance.com")}`,
+    `    ${chalk.cyan("openclaw federation pair")} --code ${chalk.yellow(code.slice(0, 20) + "...")}`,
   );
   console.log("");
 }
