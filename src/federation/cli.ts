@@ -29,23 +29,33 @@ import type { FederationCapability, PeerEndpoint, TrustedPeer } from "./types.js
 
 // ─── Helpers ────────────────────────────────────────────────
 
+/**
+ * Lightweight config reader — reads openclaw.json directly without
+ * the heavy `loadConfig()` pipeline (avoids IncludeProcessor, etc.).
+ */
+function readFederationConfig(): { instanceName?: string; endpoint?: string } {
+  try {
+    const fs = require("node:fs") as typeof import("node:fs");
+    const path = require("node:path") as typeof import("node:path");
+    const home =
+      process.env.OPENCLAW_HOME ??
+      path.join(process.env.HOME ?? process.env.USERPROFILE ?? ".", ".openclaw");
+    const configPath = process.env.OPENCLAW_CONFIG_PATH ?? path.join(home, "openclaw.json");
+    const raw = JSON.parse(fs.readFileSync(configPath, "utf8")) as {
+      federation?: { instanceName?: string; endpoint?: string };
+    };
+    return raw.federation ?? {};
+  } catch {
+    return {};
+  }
+}
+
 function resolveFederationInstanceName(): string {
-  // Priority: env var > config file > default
   if (process.env.OPENCLAW_FEDERATION_NAME) {
     return process.env.OPENCLAW_FEDERATION_NAME;
   }
-  try {
-    const { loadConfig } = require("../config/io.js") as {
-      loadConfig: () => { federation?: { instanceName?: string } };
-    };
-    const cfg = loadConfig();
-    if (cfg.federation?.instanceName) {
-      return cfg.federation.instanceName;
-    }
-  } catch {
-    // Config not available (e.g. tests), fall through to default
-  }
-  return "my-openclaw";
+  const cfg = readFederationConfig();
+  return cfg.instanceName || "my-openclaw";
 }
 
 const FEDERATION_INSTANCE_NAME = resolveFederationInstanceName();
@@ -276,15 +286,7 @@ export function registerFederationCli(program: Command): void {
         // Resolve endpoint: CLI flag > config > error
         let endpoint = opts.endpoint as string | undefined;
         if (!endpoint) {
-          try {
-            const { loadConfig } = require("../config/io.js") as {
-              loadConfig: () => { federation?: { endpoint?: string } };
-            };
-            const cfg = loadConfig();
-            endpoint = cfg.federation?.endpoint;
-          } catch {
-            // ignore
-          }
+          endpoint = readFederationConfig().endpoint;
         }
         if (!endpoint) {
           if (opts.json) {
