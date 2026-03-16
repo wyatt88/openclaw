@@ -189,43 +189,71 @@ type GatewayRpcOpts = {
 async function callFederationRpc(
   method: string,
   opts?: GatewayRpcOpts,
-  params?: unknown,
+  _params?: unknown,
 ): Promise<{ ok: boolean; [key: string]: unknown } | null> {
-  // Read token directly from config to ensure auth works in local mode.
-  // callGateway's credential resolver may clear scopes for device-less clients.
+  // Read config for token and port
   let token = opts?.token;
-  if (!token) {
-    try {
-      const raw = JSON.parse(
-        fs.readFileSync(path.join(process.env.HOME ?? "", ".openclaw", "openclaw.json"), "utf-8"),
-      );
+  let port = 18789;
+  try {
+    const raw = JSON.parse(
+      fs.readFileSync(path.join(process.env.HOME ?? "", ".openclaw", "openclaw.json"), "utf-8"),
+    );
+    if (!token) {
       token = raw?.gateway?.auth?.token ?? raw?.gateway?.remote?.token;
-    } catch {
-      // ignore
     }
+    if (raw?.gateway?.port) {
+      port = raw.gateway.port;
+    }
+  } catch {
+    // ignore
   }
-  // Retry once — first attempt can hit Gateway's 3s handshake timeout race.
-  for (let attempt = 0; attempt < 2; attempt++) {
+
+  // Map RPC method names to HTTP API paths
+  const httpPath =
+    method === "federation.listPeers"
+      ? "/api/federation/peers"
+      : method === "federation.status"
+        ? "/api/federation/status"
+        : null;
+
+  // Prefer HTTP API -- avoids Gateway WS handshake timeout issues
+  if (httpPath && token) {
     try {
-      const result = await callGateway({
-        url: opts?.url,
-        token,
-        method,
-        params: params ?? {},
-        timeoutMs: 8_000,
-        connectDelayMs: 5_000,
-        clientName: GATEWAY_CLIENT_NAMES.CLI,
-        mode: GATEWAY_CLIENT_MODES.CLI,
+      const baseUrl = opts?.url
+        ? opts.url.replace("ws://", "http://").replace("wss://", "https://")
+        : `http://127.0.0.1:${port}`;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5_000);
+      const res = await fetch(`${baseUrl}${httpPath}`, {
+        headers: { Authorization: `Bearer ${token}` },
+        signal: controller.signal,
       });
-      return result as { ok: boolean; [key: string]: unknown };
-    } catch {
-      if (attempt === 1) {
-        return null;
+      clearTimeout(timer);
+      if (res.ok) {
+        const data = (await res.json()) as { ok?: boolean; [key: string]: unknown };
+        return { ok: true, ...data };
       }
-      await new Promise((r) => setTimeout(r, 500));
+    } catch {
+      // HTTP failed, fall through to WS RPC
     }
   }
-  return null;
+
+  // Fallback: WS RPC (may hit Gateway 3s handshake timeout)
+  try {
+    const result = await callGateway({
+      url: opts?.url,
+      token,
+      method,
+      params: _params ?? {},
+      timeoutMs: 8_000,
+      connectDelayMs: 5_000,
+      clientName: GATEWAY_CLIENT_NAMES.CLI,
+      mode: GATEWAY_CLIENT_MODES.CLI,
+    });
+    return result as { ok: boolean; [key: string]: unknown };
+  } catch {
+    return null;
+  }
 }
 
 // ─── Registration ───────────────────────────────────────────
