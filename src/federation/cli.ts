@@ -191,36 +191,41 @@ async function callFederationRpc(
   opts?: GatewayRpcOpts,
   params?: unknown,
 ): Promise<{ ok: boolean; [key: string]: unknown } | null> {
-  try {
-    // If no explicit token, read from config to ensure auth works in local mode.
-    // callGateway's credential resolver may not forward the token in all scenarios
-    // (e.g. missing device identity clears scopes), so we read it directly.
-    let token = opts?.token;
-    if (!token) {
-      try {
-        const raw = JSON.parse(
-          fs.readFileSync(path.join(process.env.HOME ?? "", ".openclaw", "openclaw.json"), "utf-8"),
-        );
-        token = raw?.gateway?.auth?.token ?? raw?.gateway?.remote?.token;
-      } catch {
-        // ignore — config not readable
-      }
+  // Read token directly from config to ensure auth works in local mode.
+  // callGateway's credential resolver may clear scopes for device-less clients.
+  let token = opts?.token;
+  if (!token) {
+    try {
+      const raw = JSON.parse(
+        fs.readFileSync(path.join(process.env.HOME ?? "", ".openclaw", "openclaw.json"), "utf-8"),
+      );
+      token = raw?.gateway?.auth?.token ?? raw?.gateway?.remote?.token;
+    } catch {
+      // ignore
     }
-    const result = await callGateway({
-      url: opts?.url,
-      token,
-      method,
-      params: params ?? {},
-      timeoutMs: 15_000,
-      connectDelayMs: 10_000,
-      clientName: GATEWAY_CLIENT_NAMES.CLI,
-      mode: GATEWAY_CLIENT_MODES.CLI,
-    });
-    return result as { ok: boolean; [key: string]: unknown };
-  } catch (err) {
-    console.error(`gateway connect failed: ${String(err)}`);
-    return null;
   }
+  // Retry once — first attempt can hit Gateway's 3s handshake timeout race.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      const result = await callGateway({
+        url: opts?.url,
+        token,
+        method,
+        params: params ?? {},
+        timeoutMs: 8_000,
+        connectDelayMs: 5_000,
+        clientName: GATEWAY_CLIENT_NAMES.CLI,
+        mode: GATEWAY_CLIENT_MODES.CLI,
+      });
+      return result as { ok: boolean; [key: string]: unknown };
+    } catch {
+      if (attempt === 1) {
+        return null;
+      }
+      await new Promise((r) => setTimeout(r, 500));
+    }
+  }
+  return null;
 }
 
 // ─── Registration ───────────────────────────────────────────
