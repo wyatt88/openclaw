@@ -996,7 +996,10 @@ export class PairingManager extends EventEmitter {
     }
 
     // 6. Store the peer in trust store
-    const peerEndpoint: PeerEndpoint = body.endpoint ?? { wsUrl: data.endpoint };
+    // Prefer endpoint from response, fall back to the one in the pairing code
+    const bodyEndpoint = body.endpoint;
+    const hasEndpoint = bodyEndpoint && (bodyEndpoint.wsUrl || bodyEndpoint.httpUrl);
+    const peerEndpoint: PeerEndpoint = hasEndpoint ? bodyEndpoint : { wsUrl: data.endpoint };
     const grant =
       body.grant ??
       createCapabilityGrant(this.identity, {
