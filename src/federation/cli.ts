@@ -12,6 +12,8 @@
  * Uses Commander.js (same pattern as other OpenClaw CLI modules).
  */
 
+import * as fs from "node:fs";
+import * as path from "node:path";
 import chalk from "chalk";
 import type { Command } from "commander";
 import { callGateway } from "../gateway/call.js";
@@ -37,8 +39,6 @@ import type { FederationCapability, PeerEndpoint, TrustedPeer } from "./types.js
  */
 function readFederationConfig(): { instanceName?: string; endpoint?: string } {
   try {
-    const fs = require("node:fs") as typeof import("node:fs");
-    const path = require("node:path") as typeof import("node:path");
     const home =
       process.env.OPENCLAW_HOME ??
       path.join(process.env.HOME ?? process.env.USERPROFILE ?? ".", ".openclaw");
