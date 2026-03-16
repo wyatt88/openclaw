@@ -945,7 +945,7 @@ async function handlePairWithCode(params: {
     trustStore: params.store,
   });
 
-  const ourEndpoint = params.endpoint ?? "";
+  const ourEndpoint = params.endpoint ?? readFederationConfig().endpoint ?? "";
 
   const result = await manager.acceptPairingCode(params.code, ourEndpoint);
 
