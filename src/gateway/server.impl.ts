@@ -87,6 +87,7 @@ import { coreGatewayHandlers } from "./server-methods.js";
 import { createExecApprovalHandlers } from "./server-methods/exec-approval.js";
 import { safeParseJson } from "./server-methods/nodes.helpers.js";
 import { createSecretsHandlers } from "./server-methods/secrets.js";
+import type { GatewayRequestHandlers } from "./server-methods/types.js";
 import { hasConnectedMobileNode } from "./server-mobile-nodes.js";
 import { loadGatewayModelCatalog } from "./server-model-catalog.js";
 import { createNodeSubscriptionManager } from "./server-node-subscriptions.js";
@@ -871,6 +872,13 @@ export async function startGatewayServer(
   // scope is set via AsyncLocalStorage.
   setFallbackGatewayContext(gatewayRequestContext);
 
+  // Mutable handler map — federation handlers are added after init.
+  const gatewayExtraHandlers: GatewayRequestHandlers = {
+    ...pluginRegistry.gatewayHandlers,
+    ...execApprovalHandlers,
+    ...secretsHandlers,
+  };
+
   attachGatewayWsHandlers({
     wss,
     clients,
@@ -886,11 +894,7 @@ export async function startGatewayServer(
     logGateway: log,
     logHealth,
     logWsControl,
-    extraHandlers: {
-      ...pluginRegistry.gatewayHandlers,
-      ...execApprovalHandlers,
-      ...secretsHandlers,
-    },
+    extraHandlers: gatewayExtraHandlers,
     broadcast,
     context: gatewayRequestContext,
   });
@@ -950,6 +954,14 @@ export async function startGatewayServer(
         config: cfgAtStart.federation,
         httpServers,
       });
+      // Merge federation RPC handlers into the live handler map so
+      // Gateway WS clients can call federation.status, federation.listPeers, etc.
+      if (federationHandle?.gatewayHandlers) {
+        Object.assign(gatewayExtraHandlers, federationHandle.gatewayHandlers);
+        log.info(
+          `federation RPC handlers merged: ${Object.keys(federationHandle.gatewayHandlers).join(", ")}`,
+        );
+      }
       log.info("federation subsystem initialized");
     } catch (err) {
       log.warn(`federation init failed: ${String(err)}`);
