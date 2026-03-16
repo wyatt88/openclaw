@@ -216,7 +216,11 @@ export function registerFederationCli(program: Command): void {
   const fed = program
     .command("federation")
     .description("Federation: peer-to-peer trust, pairing, and communication")
-    .alias("fed");
+    .alias("fed")
+    .hook("postAction", () => {
+      // Ensure CLI exits after async actions complete (WS connections keep the event loop alive)
+      process.exit(0);
+    });
 
   // ─── status ─────────────────────────────────────────────
   fed
