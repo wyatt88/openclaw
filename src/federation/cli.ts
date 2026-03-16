@@ -255,7 +255,7 @@ export function registerFederationCli(program: Command): void {
     .description("Start or join a pairing session with another OpenClaw instance")
     .option("--generate", "Generate a new OC- pairing code")
     .option("--code <code>", "Join with an OC- pairing code")
-    .option("--endpoint <url>", "Federation endpoint (wss:// URL)")
+    .option("--endpoint <url>", "Federation endpoint (overrides config federation.endpoint)")
     .option("--url <url>", "Pairing server URL (legacy client mode)")
     .option("--port <port>", "Port for pairing server", "0")
     .option("--timeout <seconds>", "Pairing timeout in seconds", "300")
@@ -271,12 +271,45 @@ export function registerFederationCli(program: Command): void {
         .split(",")
         .map((c: string) => c.trim()) as FederationCapability[];
 
-      if (opts.generate && opts.endpoint) {
+      if (opts.generate) {
         // ── OC- Code Generation (new flow) ──────────────
+        // Resolve endpoint: CLI flag > config > error
+        let endpoint = opts.endpoint as string | undefined;
+        if (!endpoint) {
+          try {
+            const { loadConfig } = require("../config/io.js") as {
+              loadConfig: () => { federation?: { endpoint?: string } };
+            };
+            const cfg = loadConfig();
+            endpoint = cfg.federation?.endpoint;
+          } catch {
+            // ignore
+          }
+        }
+        if (!endpoint) {
+          if (opts.json) {
+            console.log(
+              JSON.stringify({
+                ok: false,
+                error:
+                  "No endpoint specified. Use --endpoint or set federation.endpoint in openclaw.json",
+              }),
+            );
+          } else {
+            console.error(chalk.red("\n  ❌ No endpoint specified."));
+            console.error(
+              chalk.gray(
+                "  Use --endpoint wss://... or set federation.endpoint in openclaw.json\n",
+              ),
+            );
+          }
+          process.exit(1);
+          return;
+        }
         await handlePairGenerate({
           identity,
           store,
-          endpoint: opts.endpoint,
+          endpoint,
           timeoutMs,
           capabilities,
           json: opts.json,
