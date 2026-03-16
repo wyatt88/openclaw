@@ -29,7 +29,26 @@ import type { FederationCapability, PeerEndpoint, TrustedPeer } from "./types.js
 
 // ─── Helpers ────────────────────────────────────────────────
 
-const FEDERATION_INSTANCE_NAME = process.env.OPENCLAW_FEDERATION_NAME ?? "my-openclaw";
+function resolveFederationInstanceName(): string {
+  // Priority: env var > config file > default
+  if (process.env.OPENCLAW_FEDERATION_NAME) {
+    return process.env.OPENCLAW_FEDERATION_NAME;
+  }
+  try {
+    const { loadConfig } = require("../config/io.js") as {
+      loadConfig: () => { federation?: { instanceName?: string } };
+    };
+    const cfg = loadConfig();
+    if (cfg.federation?.instanceName) {
+      return cfg.federation.instanceName;
+    }
+  } catch {
+    // Config not available (e.g. tests), fall through to default
+  }
+  return "my-openclaw";
+}
+
+const FEDERATION_INSTANCE_NAME = resolveFederationInstanceName();
 
 function getIdentity(name?: string) {
   return loadOrCreateFederationIdentity(name ?? FEDERATION_INSTANCE_NAME);
