@@ -320,8 +320,11 @@ export class FederationTransport extends EventEmitter {
     });
 
     let ws: WebSocket;
+    // Ensure the WS URL targets the federation path.
+    const fedUrl = new URL(WS_PATH, wsUrl.replace(/\/?$/, "/")).href;
+
     try {
-      ws = new WebSocket(wsUrl, {
+      ws = new WebSocket(fedUrl, {
         maxPayload: MAX_FRAME_SIZE_BYTES,
         handshakeTimeout: HANDSHAKE_TIMEOUT_MS,
         headers: {

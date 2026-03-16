@@ -1114,9 +1114,28 @@ export class PairingManager extends EventEmitter {
 
   private getLocalEndpoint(): PeerEndpoint {
     const hostname = getLocalHostname();
+    // Read endpoint from federation config
+    const configEndpoint = this.readEndpointFromConfig();
     return {
+      wsUrl: configEndpoint || undefined,
       tailnetHostname: hostname.endsWith(".ts.net") ? hostname : undefined,
     };
+  }
+
+  /** Read federation.endpoint from openclaw.json config. */
+  private readEndpointFromConfig(): string | undefined {
+    try {
+      const home =
+        process.env.OPENCLAW_HOME ??
+        path.join(process.env.HOME ?? process.env.USERPROFILE ?? ".", ".openclaw");
+      const configPath = process.env.OPENCLAW_CONFIG_PATH ?? path.join(home, "openclaw.json");
+      const raw = JSON.parse(fs.readFileSync(configPath, "utf8")) as {
+        federation?: { endpoint?: string };
+      };
+      return raw.federation?.endpoint;
+    } catch {
+      return undefined;
+    }
   }
 }
 

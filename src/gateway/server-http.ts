@@ -969,6 +969,12 @@ export function attachGatewayUpgradeHandler(opts: {
   const { httpServer, wss, canvasHost, clients, resolvedAuth, rateLimiter } = opts;
   httpServer.on("upgrade", (req, socket, head) => {
     void (async () => {
+      // Federation WS connections are handled by FederationTransport's own upgrade handler.
+      // Skip Gateway auth — Federation uses Ed25519 signature-based authentication.
+      const upgradePath = new URL(req.url ?? "/", "http://localhost").pathname;
+      if (upgradePath === "/federation") {
+        return; // Let FederationTransport's handler pick this up
+      }
       const scopedCanvas = normalizeCanvasScopedUrl(req.url ?? "/");
       if (scopedCanvas.malformedScopedPath) {
         writeUpgradeAuthFailure(socket, { ok: false, reason: "unauthorized" });
