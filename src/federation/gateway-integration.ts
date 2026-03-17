@@ -467,6 +467,39 @@ function createGatewayRpcHandlers(
         },
       });
     },
+
+    // ── federation.sendChat ──────────────────────────────
+    "federation.sendChat": async ({ respond, params }) => {
+      const { peerId, text, conversationId } = params as {
+        peerId?: string;
+        text?: string;
+        conversationId?: string;
+      };
+      if (!peerId || !text) {
+        respond({ ok: false, error: "Missing peerId or text" });
+        return;
+      }
+
+      // Resolve short peerId to full
+      const allPeers = autoConnector["trustStore"].listPeers();
+      const fullPeerId =
+        allPeers.find(
+          (p: { identity: { peerId: string } }) =>
+            p.identity.peerId === peerId || formatPeerId(p.identity.peerId) === peerId,
+        )?.identity.peerId ?? peerId;
+
+      try {
+        const result = await transport.sendChat({
+          peerId: fullPeerId,
+          text,
+          conversationId,
+          timeoutMs: 30_000,
+        });
+        respond({ ok: true, ...result });
+      } catch (err) {
+        respond({ ok: false, error: String(err) });
+      }
+    },
   };
 }
 

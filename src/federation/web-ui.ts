@@ -335,6 +335,50 @@ export function createFederationApiRoutes(opts: WebUiOptions): FederationApiRout
     },
   });
 
+  // ── POST /api/federation/chat ───────────────────────────
+  routes.push({
+    method: "POST",
+    path: "/api/federation/chat",
+    handler: async (req, res) => {
+      // Read JSON body
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) {
+        chunks.push(typeof chunk === "string" ? Buffer.from(chunk) : chunk);
+      }
+      let body: { peerId?: string; text?: string; conversationId?: string };
+      try {
+        body = JSON.parse(Buffer.concat(chunks).toString("utf-8"));
+      } catch {
+        sendJson(res, 400, { ok: false, error: "Invalid JSON body" });
+        return;
+      }
+
+      if (!body.peerId || !body.text) {
+        sendJson(res, 400, { ok: false, error: "Missing peerId or text" });
+        return;
+      }
+
+      // Resolve short peerId to full
+      const allPeers = node.trustStore.listPeers();
+      const match = allPeers.find(
+        (p) => p.identity.peerId === body.peerId || formatPeerId(p.identity.peerId) === body.peerId,
+      );
+      const fullPeerId = match?.identity.peerId ?? body.peerId;
+
+      try {
+        const result = await transport.sendChat({
+          peerId: fullPeerId,
+          text: body.text,
+          conversationId: body.conversationId,
+          timeoutMs: 30_000,
+        });
+        sendJson(res, 200, { ok: true, ...result });
+      } catch (err) {
+        sendJson(res, 502, { ok: false, error: String(err) });
+      }
+    },
+  });
+
   return routes;
 }
 

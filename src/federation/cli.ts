@@ -214,7 +214,11 @@ async function callFederationRpc(
       ? "/api/federation/peers"
       : method === "federation.status"
         ? "/api/federation/status"
-        : null;
+        : method === "federation.sendChat"
+          ? "/api/federation/chat"
+          : null;
+
+  const httpMethod = method === "federation.sendChat" ? "POST" : "GET";
 
   // Prefer HTTP API -- avoids Gateway WS handshake timeout issues
   if (httpPath && token) {
@@ -223,11 +227,16 @@ async function callFederationRpc(
         ? opts.url.replace("ws://", "http://").replace("wss://", "https://")
         : `http://127.0.0.1:${port}`;
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5_000);
-      const res = await fetch(`${baseUrl}${httpPath}`, {
-        headers: { Authorization: `Bearer ${token}` },
+      const timer = setTimeout(() => controller.abort(), 35_000); // longer for chat
+      const fetchOpts: RequestInit = {
+        method: httpMethod,
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
         signal: controller.signal,
-      });
+      };
+      if (httpMethod === "POST" && _params) {
+        fetchOpts.body = JSON.stringify(_params);
+      }
+      const res = await fetch(`${baseUrl}${httpPath}`, fetchOpts);
       clearTimeout(timer);
       if (res.ok) {
         const data = (await res.json()) as { ok?: boolean; [key: string]: unknown };
@@ -293,27 +302,32 @@ export function registerFederationCli(program: Command): void {
 
       if (liveStatus?.ok) {
         // ── Live status from Gateway ──────────────────
-        const status = liveStatus.status as {
+        // HTTP API returns flat structure, WS RPC wraps in .status/.transport
+        const status = (liveStatus.status ?? liveStatus) as {
           enabled: boolean;
           identity: { peerId: string; name: string };
           peers: Array<{
             peerId: string;
             peerIdFull?: string;
-            peerName: string;
+            peerName?: string;
+            name?: string;
             connected: boolean;
             trust: string;
             endpoint?: string;
             capabilities: string[];
-            lastSeenAt?: number;
+            lastSeenAt?: number | string;
             connectionPhase?: string;
             connectionDirection?: string;
           }>;
-          totalConnected: number;
-          totalTrusted: number;
+          totalConnected?: number;
+          totalTrusted?: number;
         };
-        const transportInfo = liveStatus.transport as {
-          activeConnections: number;
-        };
+        const transportInfo = (liveStatus.transport ??
+          (liveStatus as Record<string, unknown>).transport) as
+          | {
+              activeConnections: number;
+            }
+          | undefined;
 
         if (opts.json) {
           console.log(JSON.stringify(liveStatus, null, 2));
@@ -353,7 +367,7 @@ export function registerFederationCli(program: Command): void {
             const pStatus = peer.connected ? chalk.green("● connected") : chalk.gray("○ offline");
             const dir = peer.connectionDirection ? chalk.dim(` [${peer.connectionDirection}]`) : "";
             console.log(
-              `    ${pStatus}${dir}  ${chalk.bold(peer.peerName)} ${chalk.dim("(" + peer.peerId + ")")}`,
+              `    ${pStatus}${dir}  ${chalk.bold(peer.peerName ?? peer.name ?? "?")} ${chalk.dim("(" + peer.peerId + ")")}`,
             );
           }
         }
@@ -841,46 +855,46 @@ export function registerFederationCli(program: Command): void {
         return;
       }
 
-      if (!peer.connected) {
-        console.error(
-          chalk.yellow(`\n  ⚠️  Peer ${peer.identity.name} is not currently connected.`),
-        );
-        console.error(chalk.gray("  The message will be queued if the transport supports it.\n"));
-      }
-
       console.log(
         `\n  📤 Sending to ${chalk.bold(peer.identity.name)} (${chalk.cyan(formatPeerId(resolved))}):`,
       );
       console.log(`  > ${text}`);
       console.log("");
 
-      const identity = getIdentity();
-      const { FederationNode } = await import("./client.js");
-      const node = new FederationNode({
-        enabled: true,
-        instanceName: identity.name,
-      });
+      // Send via Gateway RPC (which uses the live transport connection)
+      const rpcResult = await callFederationRpc(
+        "federation.sendChat",
+        {},
+        {
+          peerId: resolved,
+          text,
+          conversationId: opts.conversation,
+        },
+      );
 
-      const result = node.createChatMessage({
-        peerId: resolved,
-        text,
-        conversationId: opts.conversation,
-      });
-
-      if (!result.ok) {
-        console.error(chalk.red(`  ❌ ${(result as { ok: false; error: string }).error}`));
+      if (!rpcResult || !rpcResult.ok) {
+        const error =
+          (rpcResult as { error?: string } | null)?.error ?? "Gateway unreachable or peer offline";
+        console.error(chalk.red(`  ❌ ${error}`));
         process.exit(1);
         return;
       }
 
-      const chatResult = result as { ok: true; message: unknown; conversationId: string };
+      const chatResult = rpcResult as {
+        ok: true;
+        text: string;
+        conversationId: string;
+        deferredToOwner: boolean;
+      };
       console.log(
-        chalk.green(`  ✓ Message signed`) +
+        chalk.green(`  ✓ Message delivered`) +
           chalk.dim(` (conversation: ${chatResult.conversationId})`),
       );
-      console.log(
-        chalk.gray("  📝 Note: Delivery requires a running gateway with federation enabled.\n"),
-      );
+      if (chatResult.deferredToOwner) {
+        console.log(chalk.gray("  📝 Response deferred to peer's owner agent.\n"));
+      } else {
+        console.log(chalk.cyan(`  ← ${chatResult.text}\n`));
+      }
     });
 }
 
