@@ -632,6 +632,7 @@ export async function initFederation(
     registerFederationWebRoutes({
       server: opts.httpServers[0],
       federationNode: node,
+      transport,
       config,
       gatewayToken: opts.gatewayToken,
     });

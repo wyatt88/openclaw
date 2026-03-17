@@ -14,6 +14,7 @@
  */
 
 import type http from "node:http";
+import { prependHttpHandler } from "../gateway/server-http.js";
 import type { FederationNode } from "./client.js";
 import { formatPeerId, generateChallenge } from "./crypto.js";
 import { encodePairingCode, decodePairingCode, type PairingCodeData } from "./pairing.js";
@@ -326,19 +327,21 @@ export function createFederationApiRoutes(opts: WebUiOptions): FederationApiRout
 export function registerFederationApiMiddleware(server: http.Server, opts: WebUiOptions): void {
   const routes = createFederationApiRoutes(opts);
 
-  server.on("request", async (req, res) => {
+  // Use prependHttpHandler to avoid Node.js multiple request listener race
+  // that causes "Cannot set headers after they are sent to the client" crashes.
+  prependHttpHandler(async (req, res) => {
     const url = req.url ?? "";
     const method = req.method ?? "GET";
 
     // Only handle /api/federation/* paths
     if (!url.startsWith("/api/federation/")) {
-      return;
+      return false;
     }
 
     // Auth check
     if (!validateAuth(req, opts.authToken)) {
       sendJson(res, 401, { ok: false, error: "Unauthorized — provide Bearer token" });
-      return;
+      return true;
     }
 
     // Find matching route
@@ -358,12 +361,13 @@ export function registerFederationApiMiddleware(server: http.Server, opts: WebUi
         } catch (err) {
           sendJson(res, 500, { ok: false, error: `Internal error: ${String(err)}` });
         }
-        return;
+        return true;
       }
     }
 
-    // No route matched
+    // No route matched under /api/federation/
     sendJson(res, 404, { ok: false, error: `Not found: ${method} ${url}` });
+    return true;
   });
 }
 
@@ -379,20 +383,13 @@ export function registerFederationApiMiddleware(server: http.Server, opts: WebUi
 export function registerFederationWebRoutes(params: {
   server: http.Server;
   federationNode: FederationNode;
+  transport: FederationTransport;
   config: unknown;
   gatewayToken: string;
 }): void {
-  // Create a stub transport for route creation.
-  // In production, this should be the actual FederationTransport instance.
-  // For now, we create a minimal wrapper that satisfies the route requirements.
-  const stubTransport = {
-    activeConnectionCount: 0,
-    getConnectionInfo: () => [],
-  } as unknown as FederationTransport;
-
   registerFederationApiMiddleware(params.server, {
     node: params.federationNode,
-    transport: stubTransport,
+    transport: params.transport,
     authToken: params.gatewayToken,
   });
 }
