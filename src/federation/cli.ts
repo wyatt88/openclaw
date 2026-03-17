@@ -583,8 +583,8 @@ export function registerFederationCli(program: Command): void {
           return;
         }
 
-        const connected = summary.connected;
-        const offline = summary.total - connected;
+        const connected = summary?.connected ?? peers.filter((p) => p.connected).length;
+        const offline = (summary?.total ?? peers.length) - connected;
 
         console.log("");
         const parts: string[] = [];

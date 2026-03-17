@@ -146,18 +146,26 @@ export function createFederationApiRoutes(opts: WebUiOptions): FederationApiRout
     method: "GET",
     path: "/api/federation/peers",
     handler: async (_req, res) => {
-      const trustStorePeers = node.trustStore.listPeers().map((peer) => ({
-        peerId: formatPeerId(peer.identity.peerId),
-        fullPeerId: peer.identity.peerId,
-        name: peer.identity.name,
-        connected: peer.connected,
-        trust: peer.trust,
-        endpoint: peer.endpoint.wsUrl ?? peer.endpoint.httpUrl ?? peer.endpoint.tailnetHostname,
-        capabilities: peer.grantedCapabilities.capabilities,
-        lastSeenAt: peer.lastSeenAt ? new Date(peer.lastSeenAt).toISOString() : null,
-        addedAt: new Date(peer.addedAt).toISOString(),
-        tokenAuth: false,
-      }));
+      // Merge trust store peers with live transport connection state
+      const connectionInfo = transport.getConnectionInfo();
+      const connectionMap = new Map(connectionInfo.map((c) => [c.peerId, c]));
+
+      const trustStorePeers = node.trustStore.listPeers().map((peer) => {
+        const conn = connectionMap.get(peer.identity.peerId);
+        const isConnected = conn?.phase === "Ready";
+        return {
+          peerId: formatPeerId(peer.identity.peerId),
+          fullPeerId: peer.identity.peerId,
+          name: peer.identity.name,
+          connected: isConnected,
+          trust: peer.trust,
+          endpoint: peer.endpoint.wsUrl ?? peer.endpoint.httpUrl ?? peer.endpoint.tailnetHostname,
+          capabilities: peer.grantedCapabilities.capabilities,
+          lastSeenAt: peer.lastSeenAt ? new Date(peer.lastSeenAt).toISOString() : null,
+          addedAt: new Date(peer.addedAt).toISOString(),
+          tokenAuth: false,
+        };
+      });
 
       // Include simple peers
       const simplePeers = node.listSimplePeers().map(({ peerId, peer }) => ({
@@ -173,9 +181,21 @@ export function createFederationApiRoutes(opts: WebUiOptions): FederationApiRout
         tokenAuth: true,
       }));
 
+      const allPeers = [...trustStorePeers, ...simplePeers];
+      const connectedCount = allPeers.filter((p) => p.connected).length;
+
       sendJson(res, 200, {
         ok: true,
-        peers: [...trustStorePeers, ...simplePeers],
+        thisInstance: {
+          peerId: formatPeerId(node.identity.peerId),
+          name: node.identity.name,
+        },
+        peers: allPeers,
+        summary: {
+          total: allPeers.length,
+          connected: connectedCount,
+          trusted: trustStorePeers.length,
+        },
       });
     },
   });
