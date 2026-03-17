@@ -516,7 +516,8 @@ export class FederationTransport extends EventEmitter {
       }
 
       case "pong": {
-        // Application-level pong — update last seen.
+        // Application-level pong — mark heartbeat as answered + update last seen.
+        conn.awaitingPong = false;
         if (conn.peerId) {
           this.node.trustStore.getPeer(conn.peerId);
           // lastSeenAt updated by trustStore.setConnected already.
@@ -751,7 +752,7 @@ export class FederationTransport extends EventEmitter {
   private startHeartbeat(conn: PeerConnection): void {
     this.stopHeartbeat(conn);
 
-    conn.heartbeatTimer = setInterval(() => {
+    conn.heartbeatTimer = setInterval(async () => {
       if (conn.ws.readyState !== WebSocket.OPEN) {
         this.stopHeartbeat(conn);
         return;
@@ -768,9 +769,14 @@ export class FederationTransport extends EventEmitter {
 
       conn.awaitingPong = true;
       try {
-        conn.ws.ping();
+        // Use application-level ping (text frame) instead of WS-level ping.
+        // ALB/reverse proxies may not forward WS ping frames, causing spurious disconnects.
+        const { createSignedMessage } = await import("./crypto.js");
+        const pingPayload: FederationMessagePayload = { type: "ping", data: { ts: Date.now() } };
+        const ping = createSignedMessage(this.node.identity, pingPayload);
+        this.sendFrame(conn, ping);
       } catch {
-        // Socket may have errored between readyState check and ping.
+        // Socket may have errored between readyState check and send.
         this.closeConnection(conn, conn.peerId ?? "");
       }
     }, HEARTBEAT_INTERVAL_MS);
