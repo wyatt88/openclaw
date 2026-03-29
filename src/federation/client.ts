@@ -32,6 +32,7 @@ import type {
   SignedMessage,
   SimplePeerConfig,
   FederationCapability,
+  FederationPeerHealth,
 } from "./types.js";
 
 // ─── Federation Node ────────────────────────────────────────
@@ -513,7 +514,7 @@ export class FederationNode {
   // ─── Status ─────────────────────────────────────────────
 
   getStatus(): FederationStatus {
-    const peers = this.trustStore.listPeers().map((peer) => ({
+    const peers: FederationPeerHealth[] = this.trustStore.listPeers().map((peer) => ({
       peerId: peer.identity.peerId,
       peerName: peer.identity.name,
       connected: peer.connected,

@@ -21,7 +21,7 @@ import type { FederationLocalIdentity, TrustedPeer } from "./types.js";
  *
  * Covers the full lifecycle: handshake → heartbeat → application messages.
  */
-export enum FederationMessageType {
+enum WireMessageType {
   // Handshake (mutual authentication)
   HELLO = "hello",
   HELLO_ACK = "hello_ack",
@@ -50,7 +50,7 @@ export enum FederationMessageType {
  */
 export interface FederationMessage {
   /** Message type discriminator. */
-  type: FederationMessageType;
+  type: WireMessageType;
   /** Unique message ID (UUID v4). */
   id: string;
   /** Sender peerId (SHA-256 of Ed25519 public key). */
@@ -104,7 +104,7 @@ const DEDUP_SET_CAPACITY = 1000;
  * Deterministic: keys are always in the same order.
  */
 function buildSigningPayload(
-  type: FederationMessageType,
+  type: WireMessageType,
   id: string,
   from: string,
   to: string | undefined,
@@ -197,7 +197,7 @@ export class MessageHandler {
   private readonly trustStore: TrustStore;
   private readonly dedup: DedupRing;
   private readonly maxDrift: number;
-  private readonly handlers = new Map<FederationMessageType, Handler[]>();
+  private readonly handlers = new Map<WireMessageType, Handler[]>();
 
   constructor(opts: MessageHandlerOptions) {
     this.identity = opts.identity;
@@ -216,7 +216,7 @@ export class MessageHandler {
    * @param to    - Optional target peerId.
    * @returns A fully-formed, signed {@link FederationMessage}.
    */
-  createMessage(type: FederationMessageType, payload: unknown, to?: string): FederationMessage {
+  createMessage(type: WireMessageType, payload: unknown, to?: string): FederationMessage {
     const id = uuid();
     const from = this.identity.peerId;
     const timestamp = Date.now();
@@ -268,7 +268,7 @@ export class MessageHandler {
     // 2. Structural validation
     if (
       typeof obj.type !== "string" ||
-      !Object.values(FederationMessageType).includes(obj.type as FederationMessageType)
+      !Object.values(WireMessageType).includes(obj.type as WireMessageType)
     ) {
       return { ok: false, error: `Unknown message type: ${String(obj.type)}` };
     }
@@ -289,7 +289,7 @@ export class MessageHandler {
     }
 
     const msg: FederationMessage = {
-      type: obj.type as FederationMessageType,
+      type: obj.type as WireMessageType,
       id: obj.id,
       from: obj.from,
       to: obj.to,
@@ -315,7 +315,7 @@ export class MessageHandler {
     // 5. Resolve sender public key
     let publicKeyPem: string;
 
-    if (msg.type === FederationMessageType.HELLO) {
+    if (msg.type === WireMessageType.HELLO) {
       // For HELLO the sender isn't in our trust store yet.
       // Extract the public key from the payload itself.
       const helloPayload = msg.payload as Partial<HelloPayload> | null;
@@ -360,7 +360,7 @@ export class MessageHandler {
    * Multiple handlers may be registered per type; they are called
    * in registration order.
    */
-  on(type: FederationMessageType, handler: Handler): void {
+  on(type: WireMessageType, handler: Handler): void {
     let list = this.handlers.get(type);
     if (!list) {
       list = [];
@@ -372,7 +372,7 @@ export class MessageHandler {
   /**
    * Remove a previously registered handler.
    */
-  off(type: FederationMessageType, handler: Handler): void {
+  off(type: WireMessageType, handler: Handler): void {
     const list = this.handlers.get(type);
     if (!list) {
       return;
@@ -509,7 +509,7 @@ export class HandshakeManager {
       instanceName: this.identity.name,
     };
 
-    return this.handler.createMessage(FederationMessageType.HELLO, payload);
+    return this.handler.createMessage(WireMessageType.HELLO, payload);
   }
 
   // ─── Responder: Step 2 ────────────────────────────────
@@ -522,7 +522,7 @@ export class HandshakeManager {
   handleHello(
     msg: FederationMessage,
   ): { ok: true; response: FederationMessage } | { ok: false; error: string } {
-    if (msg.type !== FederationMessageType.HELLO) {
+    if (msg.type !== WireMessageType.HELLO) {
       return { ok: false, error: `Expected HELLO, got ${msg.type}` };
     }
 
@@ -561,7 +561,7 @@ export class HandshakeManager {
     };
 
     const response = this.handler.createMessage(
-      FederationMessageType.HELLO_ACK,
+      WireMessageType.HELLO_ACK,
       ackPayload,
       payload.peerId,
     );
@@ -583,7 +583,7 @@ export class HandshakeManager {
       return { ok: false, error: "No pending outgoing handshake" };
     }
 
-    if (msg.type !== FederationMessageType.HELLO_ACK) {
+    if (msg.type !== WireMessageType.HELLO_ACK) {
       return { ok: false, error: `Expected HELLO_ACK, got ${msg.type}` };
     }
 
@@ -621,7 +621,7 @@ export class HandshakeManager {
     };
 
     const response = this.handler.createMessage(
-      FederationMessageType.AUTH_COMPLETE,
+      WireMessageType.AUTH_COMPLETE,
       authPayload,
       payload.peerId,
     );
@@ -651,7 +651,7 @@ export class HandshakeManager {
       return { ok: false, error: "No pending inbound handshake" };
     }
 
-    if (msg.type !== FederationMessageType.AUTH_COMPLETE) {
+    if (msg.type !== WireMessageType.AUTH_COMPLETE) {
       return { ok: false, error: `Expected AUTH_COMPLETE, got ${msg.type}` };
     }
 

@@ -745,8 +745,14 @@ type ExtraHttpHandler = (
 const _extraHttpHandlers: ExtraHttpHandler[] = [];
 
 /** Register a handler that runs before the main Gateway request handler. Return true if handled. */
-export function prependHttpHandler(handler: ExtraHttpHandler): void {
+export function prependHttpHandler(handler: ExtraHttpHandler): () => void {
   _extraHttpHandlers.unshift(handler);
+  return () => {
+    const idx = _extraHttpHandlers.indexOf(handler);
+    if (idx >= 0) {
+      _extraHttpHandlers.splice(idx, 1);
+    }
+  };
 }
 
 export function createGatewayHttpServer(opts: {
@@ -804,8 +810,8 @@ export function createGatewayHttpServer(opts: {
         if (handled) {
           return;
         }
-      } catch {
-        /* ignore */
+      } catch (err) {
+        console.warn(`[gateway] extra HTTP handler error: ${String(err)}`);
       }
     }
     setDefaultSecurityHeaders(res, {

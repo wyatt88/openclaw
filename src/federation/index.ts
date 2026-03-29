@@ -50,7 +50,7 @@ export { createFederationTools } from "./tools.js";
 
 // Web UI HTTP API
 export { registerFederationWebRoutes } from "./web-ui.js";
-export type { FederationWebRouteOptions } from "./web-ui.js";
+export type { WebUiOptions as FederationWebRouteOptions } from "./web-ui.js";
 
 // Types
 export type {

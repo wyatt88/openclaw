@@ -302,7 +302,14 @@ export class TrustStore {
    */
   private readonly rateCounts = new Map<
     string,
-    { minute: number; hour: number; day: number; lastReset: number }
+    {
+      minute: number;
+      hour: number;
+      day: number;
+      minuteStart: number;
+      hourStart: number;
+      dayStart: number;
+    }
   >();
 
   checkRateLimit(peerId: string): boolean {
@@ -318,12 +325,25 @@ export class TrustStore {
 
     const now = Date.now();
     let counts = this.rateCounts.get(peerId);
-    if (!counts || now - counts.lastReset > 86400000) {
-      counts = { minute: 0, hour: 0, day: 0, lastReset: now };
+    if (!counts) {
+      counts = { minute: 0, hour: 0, day: 0, minuteStart: now, hourStart: now, dayStart: now };
       this.rateCounts.set(peerId, counts);
     }
 
-    // Simple sliding window (approximate)
+    // Reset counters when their window expires
+    if (now - counts.minuteStart > 60_000) {
+      counts.minute = 0;
+      counts.minuteStart = now;
+    }
+    if (now - counts.hourStart > 3_600_000) {
+      counts.hour = 0;
+      counts.hourStart = now;
+    }
+    if (now - counts.dayStart > 86_400_000) {
+      counts.day = 0;
+      counts.dayStart = now;
+    }
+
     counts.minute++;
     counts.hour++;
     counts.day++;

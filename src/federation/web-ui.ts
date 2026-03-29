@@ -52,10 +52,22 @@ function sendJson(res: http.ServerResponse, status: number, body: unknown): void
   res.end(JSON.stringify(body));
 }
 
-function parseBody(req: http.IncomingMessage): Promise<Record<string, unknown>> {
+function parseBody(
+  req: http.IncomingMessage,
+  maxBytes = 64 * 1024,
+): Promise<Record<string, unknown>> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    req.on("data", (chunk: Buffer) => chunks.push(chunk));
+    let totalBytes = 0;
+    req.on("data", (chunk: Buffer) => {
+      totalBytes += chunk.length;
+      if (totalBytes > maxBytes) {
+        req.destroy();
+        reject(new Error(`Body exceeds max size of ${maxBytes} bytes`));
+        return;
+      }
+      chunks.push(chunk);
+    });
     req.on("end", () => {
       try {
         const text = Buffer.concat(chunks).toString("utf8");

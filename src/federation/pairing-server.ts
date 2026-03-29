@@ -228,7 +228,7 @@ export class PairingServer {
     const method = req.method?.toUpperCase();
 
     // CORS headers
-    res.setHeader("Access-Control-Allow-Origin", "*");
+    // CORS: restrict to same-origin only (no cross-origin access to pairing endpoints)
     res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
     res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 

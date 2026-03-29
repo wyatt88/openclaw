@@ -1358,12 +1358,18 @@ export async function startGatewayServer(
       try {
         const { initFederation } = await import("../federation/index.js");
         federationHandle = await initFederation({
-          config: cfgAtStart.federation,
+          config: cfgAtStart.federation as Parameters<typeof initFederation>[0]["config"],
           httpServers,
           gatewayToken: resolvedAuth.token,
-          createAgentSession: async ({ systemPrompt, peerId, peerName, text }) => {
+          createAgentSession: async ({ systemPrompt, toolAllowlist, peerId, peerName, text }) => {
             // Route federation chat through the local /v1/chat/completions endpoint.
             // This creates a scoped agent session with the federation system prompt.
+            // Tool restriction is enforced via system prompt — the /v1/chat/completions
+            // endpoint does not yet support tool allowlists natively.
+            const toolRestriction =
+              toolAllowlist.length > 0
+                ? `\n\n## TOOL RESTRICTION (ENFORCED)\nYou may ONLY use these tools: ${toolAllowlist.join(", ")}.\nDo NOT use any other tools (exec, read, write, edit, memory_search, memory_get, browser, etc). This is a hard security boundary, not a suggestion.`
+                : "";
             const baseUrl = `http://127.0.0.1:${port}`;
             const sessionKey = `federation:${peerId.slice(0, 12)}`;
             try {
@@ -1377,7 +1383,7 @@ export async function startGatewayServer(
                 body: JSON.stringify({
                   model: "openclaw",
                   messages: [
-                    { role: "system", content: systemPrompt },
+                    { role: "system", content: systemPrompt + toolRestriction },
                     {
                       role: "user",
                       content: `[Federation message from ${peerName}]\n\n${text}`,
@@ -1561,6 +1567,7 @@ export async function startGatewayServer(
       browserAuthRateLimiter.dispose();
       stopModelPricingRefresh();
       channelHealthMonitor?.stop();
+      await federationHandle?.shutdown().catch(() => {});
       clearSecretsRuntimeSnapshot();
       await close(opts);
     },

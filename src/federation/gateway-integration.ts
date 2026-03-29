@@ -13,6 +13,7 @@
  */
 
 import type http from "node:http";
+import { ErrorCodes, errorShape } from "../gateway/protocol/schema/error-codes.js";
 import type { GatewayRequestHandlers } from "../gateway/server-methods/types.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
 import { AutoConnector } from "./auto-connector.js";
@@ -283,8 +284,7 @@ function createGatewayRpcHandlers(
       const connections = transport.getConnectionInfo();
       const detailedPeers = autoConnector.getDetailedStatus();
 
-      respond({
-        ok: true,
+      respond(true, {
         status: {
           ...status,
           // Override peers with live connection state from AutoConnector
@@ -331,7 +331,11 @@ function createGatewayRpcHandlers(
       // Verify owner-level auth
       const scopes = client?.connect?.scopes ?? [];
       if (!scopes.includes("operator.admin")) {
-        respond({ ok: false, error: "Requires operator.admin scope" });
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, "Requires operator.admin scope"),
+        );
         return;
       }
 
@@ -340,10 +344,14 @@ function createGatewayRpcHandlers(
       const endpoint = params.endpoint as PeerEndpoint | undefined;
 
       if (!publicKey || !name || !endpoint) {
-        respond({
-          ok: false,
-          error: "Missing required params: publicKey, name, endpoint",
-        });
+        respond(
+          false,
+          undefined,
+          errorShape(
+            ErrorCodes.INVALID_REQUEST,
+            "Missing required params: publicKey, name, endpoint",
+          ),
+        );
         return;
       }
 
@@ -353,6 +361,14 @@ function createGatewayRpcHandlers(
         const { createCapabilityGrant, derivePeerIdFromPublicKey } = await import("./crypto.js");
 
         const peerId = derivePeerIdFromPublicKey(publicKey);
+        if (!peerId) {
+          respond(
+            false,
+            undefined,
+            errorShape(ErrorCodes.INVALID_REQUEST, "Invalid public key: could not derive peerId"),
+          );
+          return;
+        }
         const grant = createCapabilityGrant(node.identity, {
           grantee: peerId,
           capabilities,
@@ -372,8 +388,7 @@ function createGatewayRpcHandlers(
           transport.connectToPeer(endpoint);
         }
 
-        respond({
-          ok: true,
+        respond(true, {
           peer: {
             peerId: formatPeerId(peerId),
             name,
@@ -381,7 +396,11 @@ function createGatewayRpcHandlers(
           },
         });
       } catch (err) {
-        respond({ ok: false, error: `Failed to add peer: ${String(err)}` });
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, `Failed to add peer: ${String(err)}`),
+        );
       }
     },
 
@@ -389,13 +408,21 @@ function createGatewayRpcHandlers(
     "federation.removePeer": async ({ params, client, respond }) => {
       const scopes = client?.connect?.scopes ?? [];
       if (!scopes.includes("operator.admin")) {
-        respond({ ok: false, error: "Requires operator.admin scope" });
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, "Requires operator.admin scope"),
+        );
         return;
       }
 
       const peerId = params.peerId as string | undefined;
       if (!peerId) {
-        respond({ ok: false, error: "Missing required param: peerId" });
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, "Missing required param: peerId"),
+        );
         return;
       }
 
@@ -406,7 +433,11 @@ function createGatewayRpcHandlers(
       );
 
       if (!match) {
-        respond({ ok: false, error: `Peer not found: ${peerId}` });
+        respond(
+          false,
+          undefined,
+          errorShape(ErrorCodes.INVALID_REQUEST, `Peer not found: ${peerId}`),
+        );
         return;
       }
 
@@ -427,8 +458,7 @@ function createGatewayRpcHandlers(
           `sessions cleaned: ${sessionsRemoved}`,
       );
 
-      respond({
-        ok: true,
+      respond(true, {
         removed,
         peer: { peerId: formatPeerId(fullPeerId), name: peerName },
         sessionsRemoved,
@@ -453,8 +483,7 @@ function createGatewayRpcHandlers(
         connectedAt: peer.connectedAt ? new Date(peer.connectedAt).toISOString() : null,
       }));
 
-      respond({
-        ok: true,
+      respond(true, {
         thisInstance: {
           peerId: formatPeerId(node.identity.peerId),
           name: node.identity.name,
@@ -476,7 +505,7 @@ function createGatewayRpcHandlers(
         conversationId?: string;
       };
       if (!peerId || !text) {
-        respond({ ok: false, error: "Missing peerId or text" });
+        respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, "Missing peerId or text"));
         return;
       }
 
@@ -495,9 +524,9 @@ function createGatewayRpcHandlers(
           conversationId,
           timeoutMs: 30_000,
         });
-        respond({ ok: true, ...result });
+        respond(true, result);
       } catch (err) {
-        respond({ ok: false, error: String(err) });
+        respond(false, undefined, errorShape(ErrorCodes.INVALID_REQUEST, String(err)));
       }
     },
   };
@@ -754,7 +783,7 @@ function registerCodeAcceptRoute(_server: http.Server, pairingManager: PairingMa
         }
 
         // CORS headers
-        res.setHeader("Access-Control-Allow-Origin", "*");
+        // CORS: restrict to same-origin only (no cross-origin access to pairing endpoints)
         res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
         res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 

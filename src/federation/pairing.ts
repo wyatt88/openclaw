@@ -397,7 +397,10 @@ export class PairingManager extends EventEmitter {
           stored[challenge] = data;
         }
       }
-      fs.writeFileSync(this.pendingCodesPath, JSON.stringify(stored, null, 2), "utf8");
+      fs.writeFileSync(this.pendingCodesPath, JSON.stringify(stored, null, 2), {
+        encoding: "utf8",
+        mode: 0o600,
+      });
     } catch {
       // Non-fatal — codes still work in-memory for same process
     }
@@ -471,8 +474,13 @@ export class PairingManager extends EventEmitter {
       return { ok: false, error: `Invalid session state: ${session.state}` };
     }
 
-    // Validate setup code
-    if (normalizeSetupCode(payload.setupCode) !== session.setupCode) {
+    // Validate setup code (timing-safe comparison to prevent side-channel attacks)
+    const normalizedInput = Buffer.from(normalizeSetupCode(payload.setupCode));
+    const expected = Buffer.from(session.setupCode);
+    if (
+      normalizedInput.length !== expected.length ||
+      !crypto.timingSafeEqual(normalizedInput, expected)
+    ) {
       return { ok: false, error: "Invalid setup code" };
     }
 
