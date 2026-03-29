@@ -24,7 +24,7 @@ import type { IncomingMessage } from "node:http";
 import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
 import { FederationNode } from "./client.js";
-import { verifySignedMessage } from "./crypto.js";
+import { createSignedMessage, verifySignedMessage } from "./crypto.js";
 import type {
   FederationMessagePayload,
   PeerEndpoint,
@@ -149,6 +149,12 @@ export class FederationTransport extends EventEmitter {
    * For outbound connections the key is set from the trust store before connecting.
    */
   private readonly connections = new Map<string, PeerConnection>();
+
+  /**
+   * Per-peer last-seen sequence number for replay protection.
+   * Rejects any inbound message with seq <= lastSeq for that peer.
+   */
+  private readonly lastSeq = new Map<string, number>();
 
   /**
    * Inbound connections that have not yet been identified (no peerId yet).
@@ -509,7 +515,6 @@ export class FederationTransport extends EventEmitter {
       case "ping": {
         // Reply with pong through the federation node so it's signed.
         const pongPayload: FederationMessagePayload = { type: "pong", data: { ts: Date.now() } };
-        const { createSignedMessage } = await import("./crypto.js");
         const pong = createSignedMessage(this.node.identity, pongPayload);
         this.sendFrame(conn, pong);
         break;
@@ -640,6 +645,12 @@ export class FederationTransport extends EventEmitter {
 
     // ── Resolve peer public key for verification ──
 
+    // Security by design: inbound connections MUST be from peers already present
+    // in the trust store (added via pairing — QR code, setup code, or Tailscale
+    // auto-discovery). This is intentional — there is no "connect first, pair
+    // later" flow. Unknown peers are immediately rejected to prevent unauthorized
+    // message processing, resource consumption, and potential abuse.
+    //
     // During handshake on inbound connections we may not know the peerId yet.
     // The first message (Hello) carries the sender identity, so we look it
     // up in the trust store by senderId.
@@ -647,6 +658,8 @@ export class FederationTransport extends EventEmitter {
     const peer = this.node.trustStore.getPeer(senderId);
 
     if (!peer) {
+      // Peer not in trust store — reject immediately. This is the expected
+      // behavior for any connection attempt from an unknown/unpaired peer.
       log("warn", `Received message from unknown peer ${senderId.slice(0, 12)}… — closing`);
       this.closeConnection(conn, key);
       return;
@@ -662,6 +675,19 @@ export class FederationTransport extends EventEmitter {
       this.closeConnection(conn, key);
       return;
     }
+
+    // ── Sequence number validation (replay protection) ──
+    // Each peer's seq must be strictly monotonically increasing.
+    // Reject any message with seq <= lastSeq to prevent replay attacks.
+    const peerLastSeq = this.lastSeq.get(senderId) ?? 0;
+    if (signedMsg.seq <= peerLastSeq) {
+      log("warn", `Sequence number replay rejected: seq=${signedMsg.seq} lastSeq=${peerLastSeq}`, {
+        senderId: senderId.slice(0, 12) + "…",
+      });
+      // Don't close the connection — could be a reordered packet; just drop the message.
+      return;
+    }
+    this.lastSeq.set(senderId, signedMsg.seq);
 
     // Update last seen timestamp.
     this.node.trustStore.setConnected(senderId, peer.connected);
@@ -752,7 +778,7 @@ export class FederationTransport extends EventEmitter {
   private startHeartbeat(conn: PeerConnection): void {
     this.stopHeartbeat(conn);
 
-    conn.heartbeatTimer = setInterval(async () => {
+    conn.heartbeatTimer = setInterval(() => {
       if (conn.ws.readyState !== WebSocket.OPEN) {
         this.stopHeartbeat(conn);
         return;
@@ -771,7 +797,6 @@ export class FederationTransport extends EventEmitter {
       try {
         // Use application-level ping (text frame) instead of WS-level ping.
         // ALB/reverse proxies may not forward WS ping frames, causing spurious disconnects.
-        const { createSignedMessage } = await import("./crypto.js");
         const pingPayload: FederationMessagePayload = { type: "ping", data: { ts: Date.now() } };
         const ping = createSignedMessage(this.node.identity, pingPayload);
         this.sendFrame(conn, ping);
@@ -1501,8 +1526,10 @@ export class SimplePeerConnection extends EventEmitter {
 
   /**
    * Start the heartbeat ping interval.
-   * Sends a WS-level ping every 30s. If 3 consecutive pings go
-   * unanswered, the connection is considered dead and closed.
+   * Sends an application-level JSON ping every 30s (consistent with
+   * FederationTransport's heartbeat strategy — avoids WS-level pings
+   * that ALB/reverse proxies may not forward). If 3 consecutive pings
+   * go unanswered, the connection is considered dead and closed.
    */
   private startHeartbeat(): void {
     this.stopHeartbeat();
@@ -1524,7 +1551,10 @@ export class SimplePeerConnection extends EventEmitter {
 
       this.missedPongs++;
       try {
-        this.ws.ping();
+        // Use application-level ping (JSON text frame) instead of WS-level ping.
+        // This is consistent with FederationTransport's heartbeat strategy and
+        // avoids issues with ALB/reverse proxies that don't forward WS ping frames.
+        this.ws.send(JSON.stringify({ type: "ping", ts: Date.now() }));
       } catch {
         // Socket already erroring — close event will handle it.
         log("warn", `Failed to send ping to "${this.peerName}"`);
@@ -1606,6 +1636,13 @@ export class SimplePeerConnection extends EventEmitter {
       parsed = JSON.parse(text);
     } catch {
       log("warn", `Received invalid JSON from simple peer "${this.peerName}" — ignoring`);
+      return;
+    }
+
+    // Handle application-level pong (reset missed pong counter).
+    if (parsed && typeof parsed === "object" && (parsed as Record<string, unknown>).type === "pong") {
+      this.missedPongs = 0;
+      this.lastPongAt = Date.now();
       return;
     }
 

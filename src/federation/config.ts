@@ -226,6 +226,14 @@ export const FederationConfigZod = z
     bind: z
       .union([z.literal("auto"), z.literal("lan"), z.literal("loopback"), z.literal("tailnet")])
       .optional(),
+
+    /**
+     * Custom system prompt for federation chat sessions.
+     * When omitted, the built-in FEDERATION_SYSTEM_PROMPT is used.
+     * This allows operators to customize how their Agent behaves when
+     * communicating with external peers.
+     */
+    systemPrompt: z.string().min(1).max(10_000).optional(),
   })
   .strict()
   .superRefine((val, ctx) => {

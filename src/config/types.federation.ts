@@ -114,6 +114,11 @@ export type FederationConfigSection = {
   port?: number;
   /** Bind address for the federation listener. */
   bind?: "auto" | "lan" | "loopback" | "tailnet";
+  /**
+   * Custom system prompt for federation chat sessions.
+   * When omitted, the built-in FEDERATION_SYSTEM_PROMPT is used.
+   */
+  systemPrompt?: string;
 };
 
 // ─── Federation Bind Mode ───────────────────────────────────

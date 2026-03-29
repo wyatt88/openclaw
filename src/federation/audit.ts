@@ -199,7 +199,13 @@ export class FederationAuditLog {
 
     try {
       ensureDir(this.auditDir);
-      fs.appendFileSync(this.filePath, line, { encoding: "utf8" });
+      fs.appendFileSync(this.filePath, line, { encoding: "utf8", mode: 0o600 });
+      // Ensure restrictive permissions on the audit log file (owner read/write only)
+      try {
+        fs.chmodSync(this.filePath, 0o600);
+      } catch {
+        // best-effort
+      }
       this.currentFileSize += lineBytes;
     } catch (err) {
       // Audit logging should never crash the process

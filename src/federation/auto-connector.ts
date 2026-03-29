@@ -212,6 +212,14 @@ export class AutoConnector {
   // ─── Status Queries ─────────────────────────────────────
 
   /**
+   * List all peers from the trust store.
+   * Public accessor to avoid bracket-notation hacks on the private trustStore.
+   */
+  listAllPeers(): ReturnType<TrustStore["listPeers"]> {
+    return this.trustStore.listPeers();
+  }
+
+  /**
    * Check if a specific peer is currently connected (handshake complete).
    */
   isConnected(peerId: string): boolean {

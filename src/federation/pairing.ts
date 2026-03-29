@@ -30,6 +30,7 @@
 import * as crypto from "node:crypto";
 import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { resolveStateDir } from "../config/paths.js";
 import {
@@ -41,6 +42,7 @@ import {
   generateChallenge,
 } from "./crypto.js";
 import { TrustStore } from "./trust-store.js";
+import type { FederationAuditLog } from "./audit.js";
 import type {
   FederationLocalIdentity,
   FederationIdentity,
@@ -234,12 +236,24 @@ const SETUP_CODE_CHARSET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // No 0/O/I/1 to 
 /**
  * Generate a human-friendly 6-character setup code.
  * Uses characters that are unambiguous when read aloud.
+ *
+ * Uses rejection sampling to eliminate modulo bias: since the charset
+ * has 28 characters (SETUP_CODE_CHARSET.length), and 28 * 9 = 252,
+ * any random byte >= 252 would introduce a slight bias toward the
+ * first 4 characters. We discard such bytes and resample.
  */
 export function generateSetupCode(): string {
-  const bytes = crypto.randomBytes(SETUP_CODE_LENGTH);
+  const charsetLen = SETUP_CODE_CHARSET.length; // 28
+  const maxUnbiased = charsetLen * Math.floor(256 / charsetLen); // 252 = 28 * 9
   let code = "";
-  for (let i = 0; i < SETUP_CODE_LENGTH; i++) {
-    code += SETUP_CODE_CHARSET[bytes[i] % SETUP_CODE_CHARSET.length];
+  while (code.length < SETUP_CODE_LENGTH) {
+    const bytes = crypto.randomBytes(SETUP_CODE_LENGTH - code.length + 4); // extra bytes to reduce re-rolls
+    for (let i = 0; i < bytes.length && code.length < SETUP_CODE_LENGTH; i++) {
+      if (bytes[i] < maxUnbiased) {
+        code += SETUP_CODE_CHARSET[bytes[i] % charsetLen];
+      }
+      // else: discard this byte (rejection sampling) to avoid modulo bias
+    }
   }
   return code;
 }
@@ -339,6 +353,7 @@ const DEFAULT_CAPABILITIES: FederationCapability[] = ["chat"];
 export class PairingManager extends EventEmitter {
   private readonly identity: FederationLocalIdentity;
   private readonly trustStore: TrustStore;
+  private readonly auditLog?: FederationAuditLog;
   private activeSessions: Map<string, PairingSession> = new Map();
   private sessionTimers: Map<string, ReturnType<typeof setTimeout>> = new Map();
   /** Pending OC- pairing codes keyed by challenge nonce (in-memory cache). */
@@ -346,10 +361,11 @@ export class PairingManager extends EventEmitter {
   /** File path for persisting pending pairing codes (shared between CLI and Gateway). */
   private readonly pendingCodesPath: string;
 
-  constructor(params: { identity: FederationLocalIdentity; trustStore: TrustStore }) {
+  constructor(params: { identity: FederationLocalIdentity; trustStore: TrustStore; auditLog?: FederationAuditLog }) {
     super();
     this.identity = params.identity;
     this.trustStore = params.trustStore;
+    this.auditLog = params.auditLog;
     this.pendingCodesPath = path.join(
       resolveStateDir(),
       "federation",
@@ -383,7 +399,7 @@ export class PairingManager extends EventEmitter {
     }
   }
 
-  /** Save all non-expired pending codes to disk. */
+  /** Save all non-expired pending codes to disk using atomic write (write-to-tmp + rename). */
   private savePendingCodes(): void {
     try {
       const dir = path.dirname(this.pendingCodesPath);
@@ -397,10 +413,16 @@ export class PairingManager extends EventEmitter {
           stored[challenge] = data;
         }
       }
-      fs.writeFileSync(this.pendingCodesPath, JSON.stringify(stored, null, 2), {
+      // Atomic write: write to a temporary file in the same directory, then rename.
+      // This prevents corruption if multiple processes write concurrently or if
+      // the process crashes mid-write. rename() is atomic on POSIX filesystems
+      // when src and dst are on the same filesystem.
+      const tmpPath = path.join(dir, `.pending-pairing-codes.${process.pid}.${Date.now()}.tmp`);
+      fs.writeFileSync(tmpPath, JSON.stringify(stored, null, 2), {
         encoding: "utf8",
         mode: 0o600,
       });
+      fs.renameSync(tmpPath, this.pendingCodesPath);
     } catch {
       // Non-fatal — codes still work in-memory for same process
     }
@@ -433,6 +455,9 @@ export class PairingManager extends EventEmitter {
     };
 
     this.activeSessions.set(sessionId, session);
+
+    // Audit: pairing session (setup code) generated
+    this.auditLog?.logPairingEvent(this.identity.peerId, this.identity.name, "initiated");
 
     // Set expiry timer
     const timer = setTimeout(() => {
@@ -766,6 +791,9 @@ export class PairingManager extends EventEmitter {
     // Store pending code so handleCodeAcceptRequest can verify it later
     this.pendingPairingCodes.set(challenge, data);
     this.savePendingCodes();
+
+    // Audit: pairing code generated
+    this.auditLog?.logPairingEvent(this.identity.peerId, this.identity.name, "initiated");
 
     // Auto-cleanup when code expires
     setTimeout(

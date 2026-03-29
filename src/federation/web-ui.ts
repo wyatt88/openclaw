@@ -444,7 +444,7 @@ export function registerFederationApiMiddleware(server: http.Server, opts: WebUi
     // No route matched under /api/federation/
     sendJson(res, 404, { ok: false, error: `Not found: ${method} ${url}` });
     return true;
-  });
+  }, "/api/federation");
 }
 
 /**

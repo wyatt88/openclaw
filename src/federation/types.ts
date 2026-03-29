@@ -376,6 +376,11 @@ export type FederationConfig = {
   allowIntroductions?: boolean;
   /** Maximum trust depth for introductions */
   maxTrustDepth?: number;
+  /**
+   * Custom system prompt for federation chat sessions.
+   * When omitted, the built-in FEDERATION_SYSTEM_PROMPT is used.
+   */
+  systemPrompt?: string;
 };
 
 // ─── Protocol ───────────────────────────────────────────────

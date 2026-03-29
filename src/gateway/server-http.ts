@@ -742,13 +742,22 @@ type ExtraHttpHandler = (
   req: import("node:http").IncomingMessage,
   res: import("node:http").ServerResponse,
 ) => Promise<boolean>;
-const _extraHttpHandlers: ExtraHttpHandler[] = [];
+type ExtraHttpHandlerEntry = {
+  handler: ExtraHttpHandler;
+  pathPrefix?: string;
+};
+const _extraHttpHandlers: ExtraHttpHandlerEntry[] = [];
 
-/** Register a handler that runs before the main Gateway request handler. Return true if handled. */
-export function prependHttpHandler(handler: ExtraHttpHandler): () => void {
-  _extraHttpHandlers.unshift(handler);
+/** Register a handler that runs before the main Gateway request handler.
+ *  Return true if handled.
+ *  @param handler - The request handler function.
+ *  @param pathPrefix - Optional path prefix. When set, the handler only runs for URLs starting with this prefix.
+ */
+export function prependHttpHandler(handler: ExtraHttpHandler, pathPrefix?: string): () => void {
+  const entry: ExtraHttpHandlerEntry = { handler, pathPrefix };
+  _extraHttpHandlers.unshift(entry);
   return () => {
-    const idx = _extraHttpHandlers.indexOf(handler);
+    const idx = _extraHttpHandlers.indexOf(entry);
     if (idx >= 0) {
       _extraHttpHandlers.splice(idx, 1);
     }
@@ -804,9 +813,16 @@ export function createGatewayHttpServer(opts: {
 
   async function handleRequest(req: IncomingMessage, res: ServerResponse) {
     // Run extra handlers first (federation, etc.)
-    for (const handler of _extraHttpHandlers) {
+    for (const entry of _extraHttpHandlers) {
       try {
-        const handled = await handler(req, res);
+        // If handler has a pathPrefix, only run it for matching URLs
+        if (entry.pathPrefix) {
+          const reqPath = new URL(req.url ?? "/", "http://localhost").pathname;
+          if (!reqPath.startsWith(entry.pathPrefix)) {
+            continue;
+          }
+        }
+        const handled = await entry.handler(req, res);
         if (handled) {
           return;
         }
@@ -1058,7 +1074,12 @@ export function attachGatewayUpgradeHandler(opts: {
       // Skip Gateway auth — Federation uses Ed25519 signature-based authentication.
       const upgradePath = new URL(req.url ?? "/", "http://localhost").pathname;
       if (upgradePath === "/federation") {
-        return; // Let FederationTransport's handler pick this up
+        // Safety check: only skip Gateway auth if a federation handler is actually registered.
+        // If no handler is registered, fall through to normal Gateway processing (reject connection).
+        if (_extraHttpHandlers.length > 0) {
+          return; // Let FederationTransport's handler pick this up
+        }
+        // No federation handler registered — fall through to reject the connection.
       }
       const configSnapshot = loadConfig();
       const trustedProxies = configSnapshot.gateway?.trustedProxies ?? [];

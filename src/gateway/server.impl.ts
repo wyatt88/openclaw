@@ -1361,6 +1361,13 @@ export async function startGatewayServer(
           config: cfgAtStart.federation as Parameters<typeof initFederation>[0]["config"],
           httpServers,
           gatewayToken: resolvedAuth.token,
+          // NOTE: resolvedAuth.token is captured as a startup-time snapshot in this closure.
+          // The createAgentSession callback below closes over resolvedAuth.token at the time
+          // initFederation() is called. If the gateway token is later changed via hot reload
+          // or config update, the federation session will still use the OLD token for its
+          // internal /v1/chat/completions requests. To pick up a new token, a full gateway
+          // restart is required. This is acceptable because token rotation is rare and a
+          // restart ensures all subsystems are consistent.
           createAgentSession: async ({ systemPrompt, toolAllowlist, peerId, peerName, text }) => {
             // Route federation chat through the local /v1/chat/completions endpoint.
             // This creates a scoped agent session with the federation system prompt.

@@ -16,6 +16,7 @@ import type http from "node:http";
 import { ErrorCodes, errorShape } from "../gateway/protocol/schema/error-codes.js";
 import type { GatewayRequestHandlers } from "../gateway/server-methods/types.js";
 import { createSubsystemLogger } from "../logging/subsystem.js";
+import { FederationAuditLog } from "./audit.js";
 import { AutoConnector } from "./auto-connector.js";
 import { FederationNode } from "./client.js";
 import { formatPeerId } from "./crypto.js";
@@ -275,6 +276,7 @@ function createGatewayRpcHandlers(
   transport: FederationTransport,
   sessionManager: FederationSessionManager,
   autoConnector: AutoConnector,
+  auditLog: FederationAuditLog,
 ): GatewayRequestHandlers {
   return {
     // ── federation.status ─────────────────────────────────
@@ -450,6 +452,12 @@ function createGatewayRpcHandlers(
       // Remove from trust store
       const removed = node.trustStore.removePeer(fullPeerId);
 
+      // Audit: peer removal
+      auditLog.logSecurityEvent(fullPeerId, "peer_removed", {
+        peerName,
+        removedBy: "gateway_rpc",
+      });
+
       // Clean up sessions for this peer
       const sessionsRemoved = sessionManager.removeAllForPeer(fullPeerId);
 
@@ -510,10 +518,10 @@ function createGatewayRpcHandlers(
       }
 
       // Resolve short peerId to full
-      const allPeers = autoConnector["trustStore"].listPeers();
+      const allPeers = autoConnector.listAllPeers();
       const fullPeerId =
         allPeers.find(
-          (p: { identity: { peerId: string } }) =>
+          (p) =>
             p.identity.peerId === peerId || formatPeerId(p.identity.peerId) === peerId,
         )?.identity.peerId ?? peerId;
 
@@ -595,11 +603,19 @@ export async function initFederation(
   // ── Step 2: Create session manager ──────────────────────
   const sessionManager = new FederationSessionManager();
 
+  // ── Step 2.5: Create audit log ─────────────────────────
+  const auditLog = new FederationAuditLog();
+
   // ── Step 3: Register chat handler ───────────────────────
   // This handler is invoked when a verified peer sends a chat message.
   // It creates an isolated Agent session with restricted tools and
   // the federation system prompt. The session does NOT have access to
   // files, exec, memory, or any owner-private resources.
+  //
+  // The system prompt is configurable via config.systemPrompt, falling back
+  // to the built-in FEDERATION_SYSTEM_PROMPT when not specified.
+  const effectiveSystemPrompt = config.systemPrompt ?? FEDERATION_SYSTEM_PROMPT;
+
   node.onChat(async ({ peerId, peerName, conversationId, text }) => {
     log.info(
       `federation chat from ${peerName} (${formatPeerId(peerId)}): ` +
@@ -612,8 +628,15 @@ export async function initFederation(
     // If the host provided an agent session factory, use it
     if (opts.createAgentSession) {
       try {
+        // Audit: agent session creation for inbound federation chat
+        auditLog.logSecurityEvent(peerId, "agent_session_created", {
+          peerName,
+          conversationId,
+          textLength: text.length,
+        });
+
         const response = await opts.createAgentSession({
-          systemPrompt: FEDERATION_SYSTEM_PROMPT,
+          systemPrompt: effectiveSystemPrompt,
           toolAllowlist: FEDERATION_TOOL_ALLOWLIST,
           peerId,
           peerName,
@@ -678,7 +701,7 @@ export async function initFederation(
 
   // ── Step 7: Create Gateway RPC handlers ─────────────────
   const autoConnector = new AutoConnector({ node, trustStore: node.trustStore, transport });
-  const gatewayHandlers = createGatewayRpcHandlers(node, transport, sessionManager, autoConnector);
+  const gatewayHandlers = createGatewayRpcHandlers(node, transport, sessionManager, autoConnector, auditLog);
   log.info(`federation RPC methods registered: ${Object.keys(gatewayHandlers).join(", ")}`);
 
   // ── Step 8: Start AutoConnector ─────────────────────────
@@ -707,6 +730,7 @@ export async function initFederation(
   const pairingManager = new PairingManager({
     identity: node.identity,
     trustStore: node.trustStore,
+    auditLog,
   });
 
   // Forward pairing events to the node so callers can listen
@@ -878,6 +902,7 @@ function registerCodeAcceptRoute(_server: http.Server, pairingManager: PairingMa
           return true;
         }
       },
+      "/federation",
     );
     log.info("federation code-accept handler registered via prependHttpHandler");
   });
