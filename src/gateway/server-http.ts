@@ -737,6 +737,18 @@ export function createHooksRequestHandler(
   };
 }
 
+// Federation / extension request handlers (registered at runtime via prependHttpHandler)
+type ExtraHttpHandler = (
+  req: import("node:http").IncomingMessage,
+  res: import("node:http").ServerResponse,
+) => Promise<boolean>;
+const _extraHttpHandlers: ExtraHttpHandler[] = [];
+
+/** Register a handler that runs before the main Gateway request handler. Return true if handled. */
+export function prependHttpHandler(handler: ExtraHttpHandler): void {
+  _extraHttpHandlers.unshift(handler);
+}
+
 export function createGatewayHttpServer(opts: {
   canvasHost: CanvasHostHandler | null;
   clients: Set<GatewayWsClient>;
@@ -785,6 +797,17 @@ export function createGatewayHttpServer(opts: {
       });
 
   async function handleRequest(req: IncomingMessage, res: ServerResponse) {
+    // Run extra handlers first (federation, etc.)
+    for (const handler of _extraHttpHandlers) {
+      try {
+        const handled = await handler(req, res);
+        if (handled) {
+          return;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
     setDefaultSecurityHeaders(res, {
       strictTransportSecurity: strictTransportSecurityHeader,
     });
@@ -1025,6 +1048,12 @@ export function attachGatewayUpgradeHandler(opts: {
   } = opts;
   httpServer.on("upgrade", (req, socket, head) => {
     void (async () => {
+      // Federation WS connections are handled by FederationTransport's own upgrade handler.
+      // Skip Gateway auth — Federation uses Ed25519 signature-based authentication.
+      const upgradePath = new URL(req.url ?? "/", "http://localhost").pathname;
+      if (upgradePath === "/federation") {
+        return; // Let FederationTransport's handler pick this up
+      }
       const configSnapshot = loadConfig();
       const trustedProxies = configSnapshot.gateway?.trustedProxies ?? [];
       const allowRealIpFallback = configSnapshot.gateway?.allowRealIpFallback === true;

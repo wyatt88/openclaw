@@ -101,6 +101,7 @@ import { createExecApprovalHandlers } from "./server-methods/exec-approval.js";
 import { safeParseJson } from "./server-methods/nodes.helpers.js";
 import { createPluginApprovalHandlers } from "./server-methods/plugin-approval.js";
 import { createSecretsHandlers } from "./server-methods/secrets.js";
+import type { GatewayRequestHandlers } from "./server-methods/types.js";
 import { hasConnectedMobileNode } from "./server-mobile-nodes.js";
 import { loadGatewayModelCatalog } from "./server-model-catalog.js";
 import { createNodeSubscriptionManager } from "./server-node-subscriptions.js";
@@ -755,6 +756,9 @@ export async function startGatewayServer(
   let skillsChangeUnsub = () => {};
   let channelHealthMonitor: ReturnType<typeof startChannelHealthMonitor> | null = null;
   let stopModelPricingRefresh = () => {};
+  let federationHandle: Awaited<
+    ReturnType<typeof import("../federation/index.js").initFederation>
+  > | null = null;
   let configReloader: { stop: () => Promise<void> } = { stop: async () => {} };
   const closeOnStartupFailure = async () => {
     if (diagnosticsEnabled) {
@@ -769,6 +773,7 @@ export async function startGatewayServer(
     browserAuthRateLimiter.dispose();
     stopModelPricingRefresh();
     channelHealthMonitor?.stop();
+    federationHandle?.shutdown().catch(() => {});
     clearSecretsRuntimeSnapshot();
     await createGatewayCloseHandler({
       bonjourStop,
@@ -1267,6 +1272,14 @@ export async function startGatewayServer(
     // current gateway context without relying on a startup snapshot.
     setFallbackGatewayContextResolver(() => gatewayRequestContext);
 
+    // Mutable handler map — federation handlers are added after init.
+    const gatewayExtraHandlers: GatewayRequestHandlers = {
+      ...pluginRegistry.gatewayHandlers,
+      ...execApprovalHandlers,
+      ...pluginApprovalHandlers,
+      ...secretsHandlers,
+    };
+
     attachGatewayWsHandlers({
       wss,
       clients,
@@ -1283,12 +1296,7 @@ export async function startGatewayServer(
       logGateway: log,
       logHealth,
       logWsControl,
-      extraHandlers: {
-        ...pluginRegistry.gatewayHandlers,
-        ...execApprovalHandlers,
-        ...pluginApprovalHandlers,
-        ...secretsHandlers,
-      },
+      extraHandlers: gatewayExtraHandlers,
       broadcast,
       context: gatewayRequestContext,
     });
@@ -1343,6 +1351,70 @@ export async function startGatewayServer(
         logHooks,
         logChannels,
       }));
+    }
+
+    // ── Federation subsystem ──────────────────────────────────
+    if (!minimalTestGateway && cfgAtStart.federation?.enabled) {
+      try {
+        const { initFederation } = await import("../federation/index.js");
+        federationHandle = await initFederation({
+          config: cfgAtStart.federation,
+          httpServers,
+          gatewayToken: resolvedAuth.token,
+          createAgentSession: async ({ systemPrompt, peerId, peerName, text }) => {
+            // Route federation chat through the local /v1/chat/completions endpoint.
+            // This creates a scoped agent session with the federation system prompt.
+            const baseUrl = `http://127.0.0.1:${port}`;
+            const sessionKey = `federation:${peerId.slice(0, 12)}`;
+            try {
+              const res = await fetch(`${baseUrl}/v1/chat/completions`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: `Bearer ${resolvedAuth.token}`,
+                  "X-Session-Key": sessionKey,
+                },
+                body: JSON.stringify({
+                  model: "openclaw",
+                  messages: [
+                    { role: "system", content: systemPrompt },
+                    {
+                      role: "user",
+                      content: `[Federation message from ${peerName}]\n\n${text}`,
+                    },
+                  ],
+                }),
+              });
+              if (!res.ok) {
+                const body = await res.text().catch(() => "");
+                log.warn(`federation agent session HTTP ${res.status}: ${body.slice(0, 200)}`);
+                return `I received your message but encountered an error (${res.status}). Please try again.`;
+              }
+              const data = (await res.json()) as {
+                choices?: Array<{ message?: { content?: string } }>;
+              };
+              return (
+                data.choices?.[0]?.message?.content ??
+                "I received your message but could not generate a response."
+              );
+            } catch (err) {
+              log.error(`federation createAgentSession fetch error: ${String(err)}`);
+              return "I'm sorry, I encountered an error processing your message. Please try again.";
+            }
+          },
+        });
+        // Merge federation RPC handlers into the live handler map so
+        // Gateway WS clients can call federation.status, federation.listPeers, etc.
+        if (federationHandle?.gatewayHandlers) {
+          Object.assign(gatewayExtraHandlers, federationHandle.gatewayHandlers);
+          log.info(
+            `federation RPC handlers merged: ${Object.keys(federationHandle.gatewayHandlers).join(", ")}`,
+          );
+        }
+        log.info("federation subsystem initialized");
+      } catch (err) {
+        log.warn(`federation init failed: ${String(err)}`);
+      }
     }
 
     // Run gateway_start plugin hook (fire-and-forget)
